@@ -1,26 +1,17 @@
-# Secrets - jamais sur GitHub
-backend/.env
-mobile/.env
-rope-app/.env
+# Secrets
+.env
+**/.env
 
 # Dependencies
 node_modules/
-backend/node_modules/
-mobile/node_modules/
-rope-app/node_modules/
+**/node_modules/
 
 # Expo
-mobile/.expo/
-rope-app/.expo/
-mobile/dist/
-rope-app/dist/
-
-# Docker volumes
-pgdata/
+**/.expo/
+dist/
+**/dist/
 
 # OS
 .DS_Store
+**/.DS_Store
 *.log
-mobile/.env
-.env
-**/.env
