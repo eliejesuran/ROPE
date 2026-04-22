@@ -1,0 +1,57 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: euromsg_postgres
+    environment:
+      POSTGRES_DB: euromsg_db
+      POSTGRES_USER: euromsg_user
+      POSTGRES_PASSWORD: devpassword_changeme
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U euromsg_user -d euromsg_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: euromsg_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: euromsg_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://euromsg_user:devpassword_changeme@postgres:5432/euromsg_db
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: dev_jwt_secret_change_in_production_min64chars_xxxxx
+      JWT_EXPIRES_IN: 30d
+      OTP_BYPASS_CODE: "123456"
+      OTP_BYPASS_ENABLED: "true"
+      SERVER_PEPPER: dev_pepper_change_in_production_xxxxx
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+volumes:
+  pgdata:
