@@ -3,24 +3,24 @@ version: '3.9'
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: euromsg_postgres
+    container_name: rope_postgres
     environment:
-      POSTGRES_DB: euromsg_db
-      POSTGRES_USER: euromsg_user
+      POSTGRES_DB: rope_db
+      POSTGRES_USER: rope_user
       POSTGRES_PASSWORD: devpassword_changeme
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U euromsg_user -d euromsg_db"]
+      test: ["CMD-SHELL", "pg_isready -U rope_user -d rope_db"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: euromsg_redis
+    container_name: rope_redis
     ports:
       - "6379:6379"
     healthcheck:
@@ -31,7 +31,7 @@ services:
 
   backend:
     build: ./backend
-    container_name: euromsg_backend
+    container_name: rope_backend
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,7 +40,7 @@ services:
     environment:
       NODE_ENV: development
       PORT: 3000
-      DATABASE_URL: postgresql://euromsg_user:devpassword_changeme@postgres:5432/euromsg_db
+      DATABASE_URL: postgresql://rope_user:devpassword_changeme@postgres:5432/rope_db
       REDIS_URL: redis://redis:6379
       JWT_SECRET: dev_jwt_secret_change_in_production_min64chars_xxxxx
       JWT_EXPIRES_IN: 30d

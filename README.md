@@ -1,4 +1,4 @@
-# €uroMsg
+# ROPE
 
 > Messagerie privée, basée sur le numéro de téléphone, 100% Union Européenne, RGPD by design.
 
@@ -27,7 +27,7 @@
 
 ```bash
 # Cloner et entrer dans le projet
-cd euromsg
+cd rope
 
 # Lancer PostgreSQL + Redis + Backend
 docker-compose up -d
