@@ -3,6 +3,11 @@ const express = require('express');
 const router = express.Router();
 const { authenticate } = require('../middleware/auth');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+
+function deterministicPhoneHash(phone, pepper) {
+  return crypto.createHmac('sha256', pepper).update(phone).digest('hex');
+}
 const { pool } = require('../models/db');
 const logger = require('../services/logger');
 
@@ -27,11 +32,11 @@ router.post('/find', async (req, res) => {
        FROM users WHERE deleted_at IS NULL`
     );
 
+    const searchHash = deterministicPhoneHash(cleaned, process.env.SERVER_PEPPER);
     let found = null;
     for (const user of users) {
       if (user.id === req.userId) continue;
-      const match = await bcrypt.compare(cleaned + process.env.SERVER_PEPPER, user.phone_hash);
-      if (match) { found = user; break; }
+      if (user.phone_hash === searchHash) { found = user; break; }
     }
 
     if (!found) {

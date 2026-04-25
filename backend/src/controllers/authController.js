@@ -1,4 +1,5 @@
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const { pool } = require('../models/db');
@@ -13,6 +14,12 @@ function normalisePhone(phone) {
     throw new Error('Invalid phone number format. Use E.164 (e.g. +32471234567)');
   }
   return cleaned;
+}
+
+// Deterministic hash for phone lookup (SHA-256 + pepper)
+// Used for finding existing users — bcrypt is random so can't be used for lookup
+function deterministicPhoneHash(phone, pepper) {
+  return crypto.createHmac('sha256', pepper).update(phone).digest('hex');
 }
 
 function generateOtp() {
@@ -34,7 +41,8 @@ exports.requestOtp = async (req, res) => {
     if (!phone) return res.status(400).json({ error: 'Phone number required' });
 
     const normalisedPhone = normalisePhone(phone);
-    const phoneHash = await bcrypt.hash(normalisedPhone + process.env.SERVER_PEPPER, 10);
+    // Use deterministic hash so the same phone always maps to the same record
+    const phoneHash = deterministicPhoneHash(normalisedPhone, process.env.SERVER_PEPPER);
 
     // Generate OTP (bypass in dev mode)
     const otp = process.env.OTP_BYPASS_ENABLED === 'true'
@@ -90,10 +98,8 @@ exports.verifyOtp = async (req, res) => {
 
     let validOtp = null;
     for (const row of otpRows) {
-      const phoneMatch = await bcrypt.compare(
-        normalisedPhone + process.env.SERVER_PEPPER,
-        row.phone_hash
-      );
+      const expectedHash = deterministicPhoneHash(normalisedPhone, process.env.SERVER_PEPPER);
+      const phoneMatch = (expectedHash === row.phone_hash);
       if (phoneMatch) {
         if (row.attempts >= 5) {
           return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
@@ -120,7 +126,8 @@ exports.verifyOtp = async (req, res) => {
     await pool.query('UPDATE otp_codes SET used = TRUE WHERE id = $1', [validOtp.id]);
 
     const phoneLast4 = normalisedPhone.slice(-4);
-    const phoneHash = await bcrypt.hash(normalisedPhone + process.env.SERVER_PEPPER, 10);
+    // Use deterministic hash so the same phone always maps to the same record
+    const phoneHash = deterministicPhoneHash(normalisedPhone, process.env.SERVER_PEPPER);
 
     // Upsert user
     const { rows: userRows } = await pool.query(

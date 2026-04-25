@@ -101,12 +101,48 @@ export default function ConversationListScreen({ onOpenConversation }: Props) {
     </TouchableOpacity>
   );
 
+  const handleMenu = () => {
+    Alert.alert(
+      'Menu',
+      null,
+      [
+        { text: 'Se déconnecter', onPress: logout },
+        {
+          text: 'Supprimer mon compte',
+          style: 'destructive',
+          onPress: () => {
+            Alert.alert(
+              'Supprimer le compte ?',
+              'Toutes vos données seront effacées définitivement (RGPD). Cette action est irréversible.',
+              [
+                { text: 'Annuler', style: 'cancel' },
+                {
+                  text: 'Supprimer',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      await api.account.delete();
+                      await logout();
+                    } catch (err: any) {
+                      Alert.alert('Erreur', err.message);
+                    }
+                  },
+                },
+              ]
+            );
+          },
+        },
+        { text: 'Annuler', style: 'cancel' },
+      ]
+    );
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>ROPE</Text>
-        <TouchableOpacity onPress={logout}>
-          <Text style={styles.logoutBtn}>Déco.</Text>
+        <TouchableOpacity onPress={handleMenu}>
+          <Text style={styles.logoutBtn}>⋯</Text>
         </TouchableOpacity>
       </View>
 
