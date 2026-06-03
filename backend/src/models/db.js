@@ -47,7 +47,7 @@ const SCHEMA = `
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
     sender_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    ciphertext TEXT NOT NULL,          -- AES-256-GCM encrypted payload (base64)
+    ciphertext TEXT NOT NULL,          -- AES-256-GCM encrypted payload + auth tag (base64)
     iv TEXT NOT NULL,                  -- Initialisation vector (base64)
     sent_at TIMESTAMPTZ DEFAULT NOW(),
     delivered_at TIMESTAMPTZ,

@@ -1,19 +1,15 @@
 /**
- * ROPE Crypto Service
- * ──────────────────────
- * AES-256-CTR end-to-end encryption via aes-js (pure JS, works in React Native).
- * All encryption/decryption happens on the device.
- * The server NEVER receives plaintext or keys.
+ * ROPE Crypto — AES-256-GCM via Web Crypto API (Hermes / RN 0.73+)
+ * All encryption happens on-device. Server never sees plaintext or keys.
  */
 
 import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
-import AES from 'aes-js';
 
 const KEY_SIZE = 32; // 256 bits
-const IV_SIZE  = 16; // 128 bits for CTR
+const IV_SIZE  = 12; // 96 bits — GCM standard
 
-// ── Key generation ────────────────────────────────────────────────────────────
+// ── Key generation ─────────────────────────────────────────────────────────
 
 export async function generateConversationKey(): Promise<string> {
   const keyBytes = await Crypto.getRandomBytesAsync(KEY_SIZE);
@@ -23,20 +19,17 @@ export async function generateConversationKey(): Promise<string> {
 export async function getOrCreateDeviceKeypair(): Promise<{ publicKey: string }> {
   const existing = await SecureStore.getItemAsync('device_private_key');
   if (existing) {
-    const pubKey = await SecureStore.getItemAsync('device_public_key');
-    return { publicKey: pubKey! };
+    return { publicKey: (await SecureStore.getItemAsync('device_public_key'))! };
   }
-
-  const privateKeyBytes = await Crypto.getRandomBytesAsync(KEY_SIZE);
-  const publicKeyBytes  = await Crypto.getRandomBytesAsync(KEY_SIZE);
-
-  await SecureStore.setItemAsync('device_private_key', uint8ArrayToBase64(privateKeyBytes));
-  await SecureStore.setItemAsync('device_public_key',  uint8ArrayToBase64(publicKeyBytes));
-
-  return { publicKey: uint8ArrayToBase64(publicKeyBytes) };
+  // Placeholder keypair — replaced by Curve25519 in Sprint 2 (X3DH)
+  const priv = await Crypto.getRandomBytesAsync(KEY_SIZE);
+  const pub  = await Crypto.getRandomBytesAsync(KEY_SIZE);
+  await SecureStore.setItemAsync('device_private_key', uint8ArrayToBase64(priv));
+  await SecureStore.setItemAsync('device_public_key',  uint8ArrayToBase64(pub));
+  return { publicKey: uint8ArrayToBase64(pub) };
 }
 
-// ── Conversation key storage ──────────────────────────────────────────────────
+// ── Conversation key storage ───────────────────────────────────────────────
 
 export async function storeConversationKey(conversationId: string, key: string): Promise<void> {
   await SecureStore.setItemAsync(`conv_key_${conversationId}`, key);
@@ -46,7 +39,13 @@ export async function getConversationKey(conversationId: string): Promise<string
   return SecureStore.getItemAsync(`conv_key_${conversationId}`);
 }
 
-// ── Encrypt (AES-256-CTR) ─────────────────────────────────────────────────────
+// ── AES-256-GCM ────────────────────────────────────────────────────────────
+
+async function importAesKey(base64: string, usage: 'encrypt' | 'decrypt'): Promise<CryptoKey> {
+  return globalThis.crypto.subtle.importKey(
+    'raw', base64ToUint8Array(base64), { name: 'AES-GCM' }, false, [usage]
+  );
+}
 
 export async function encryptMessage(
   plaintext: string,
@@ -55,20 +54,20 @@ export async function encryptMessage(
   const keyBase64 = await getConversationKey(conversationId);
   if (!keyBase64) throw new Error('No key found for this conversation');
 
-  const key            = base64ToUint8Array(keyBase64);
-  const ivBytes        = await Crypto.getRandomBytesAsync(IV_SIZE);
-  const plaintextBytes = new TextEncoder().encode(plaintext);
+  const iv  = await Crypto.getRandomBytesAsync(IV_SIZE);
+  const key = await importAesKey(keyBase64, 'encrypt');
 
-  const aesCtr   = new AES.ModeOfOperation.ctr(key, new AES.Counter(ivBytes));
-  const encrypted = aesCtr.encrypt(plaintextBytes);
+  const encrypted = await globalThis.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(plaintext)
+  );
 
   return {
-    ciphertext: uint8ArrayToBase64(encrypted),
-    iv:         uint8ArrayToBase64(ivBytes),
+    ciphertext: uint8ArrayToBase64(new Uint8Array(encrypted)),
+    iv: uint8ArrayToBase64(iv),
   };
 }
-
-// ── Decrypt (AES-256-CTR) ─────────────────────────────────────────────────────
 
 export async function decryptMessage(
   ciphertext: string,
@@ -78,17 +77,18 @@ export async function decryptMessage(
   const keyBase64 = await getConversationKey(conversationId);
   if (!keyBase64) throw new Error('No key found for this conversation');
 
-  const key             = base64ToUint8Array(keyBase64);
-  const ivBytes         = base64ToUint8Array(iv);
-  const ciphertextBytes = base64ToUint8Array(ciphertext);
+  const key = await importAesKey(keyBase64, 'decrypt');
 
-  const aesCtr   = new AES.ModeOfOperation.ctr(key, new AES.Counter(ivBytes));
-  const decrypted = aesCtr.decrypt(ciphertextBytes);
+  const decrypted = await globalThis.crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: base64ToUint8Array(iv) },
+    key,
+    base64ToUint8Array(ciphertext)
+  );
 
   return new TextDecoder().decode(decrypted);
 }
 
-// ── Utils ─────────────────────────────────────────────────────────────────────
+// ── Utils ──────────────────────────────────────────────────────────────────
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
   let binary = '';

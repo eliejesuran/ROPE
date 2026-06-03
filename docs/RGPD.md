@@ -66,7 +66,7 @@ Aucun transfert de données hors Union Européenne.
 ### Sécurité
 
 - Chiffrement en transit : TLS 1.3
-- Chiffrement des messages : AES-256-GCM (bout en bout, clé côté client)
+- Chiffrement des messages : AES-256-GCM AEAD (bout en bout, clé côté client, authentification intégrée)
 - Stockage des mots de passe / codes : bcrypt (facteur 10)
 - Journaux : pseudonymisés (UUID uniquement)
 - Accès serveur : restreint, authentification à deux facteurs

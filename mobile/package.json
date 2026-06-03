@@ -12,7 +12,6 @@
     "@react-native-clipboard/clipboard": "^1.16.3",
     "@react-navigation/native": "^7.2.2",
     "@react-navigation/stack": "^7.8.10",
-    "aes-js": "^3.1.2",
     "expo": "~54.0.33",
     "expo-clipboard": "~8.0.8",
     "expo-crypto": "~15.0.8",
@@ -27,7 +26,6 @@
     "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
-    "@types/aes-js": "^3.1.4",
     "@types/react": "~19.1.0",
     "typescript": "~5.9.2"
   },
