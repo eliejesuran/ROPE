@@ -4,13 +4,13 @@ import {
   StyleSheet, KeyboardAvoidingView, Platform, Alert,
   ActivityIndicator,
 } from 'react-native';
-import * as Clipboard from 'expo-clipboard';
 import * as SecureStore from 'expo-secure-store';
 import { api } from '../services/api';
 import { useAuth } from '../services/authContext';
 import {
   encryptMessage, decryptMessage,
-  generateConversationKey, storeConversationKey, getConversationKey,
+  getConversationKey,
+  x3dhInitiator, x3dhResponder,
 } from '../services/crypto';
 import { onNewMessage, offNewMessage, getSocket } from '../services/socket';
 
@@ -35,14 +35,16 @@ interface Props {
   onBack: () => void;
 }
 
+type KeyStatus = 'establishing' | 'ready' | 'error';
+
 export default function ChatScreen({ conversation, onBack }: Props) {
   const { user } = useAuth();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [hasKey, setHasKey] = useState(false);
+  const [keyStatus, setKeyStatus] = useState<KeyStatus>('establishing');
   const [loading, setLoading] = useState(true);
-  const [isInitiator, setIsInitiator] = useState(false);
   const flatListRef = useRef<FlatList>(null);
   const convId = conversation.conversation_id;
 
@@ -67,10 +69,56 @@ export default function ChatScreen({ conversation, onBack }: Props) {
     }
   }, [convId]);
 
+  // ── Auto-establish X3DH session ───────────────────────────────────────────
   useEffect(() => {
     (async () => {
-      const key = await getConversationKey(convId);
-      if (key) setHasKey(true);
+      // If a key already exists (prior session or manual), use it directly
+      const existing = await getConversationKey(convId);
+      if (existing) {
+        setHasKey(true);
+        setKeyStatus('ready');
+        await loadMessages();
+        return;
+      }
+
+      setKeyStatus('establishing');
+      try {
+        // Try as responder first: check if the other party already posted X3DH init
+        let initData: { ikPub: string; ekPub: string; opkId: number | null } | null = null;
+        try {
+          initData = await api.keys.getX3DHInit(convId);
+        } catch {
+          // 404 or 403 — no init exists yet, we become the initiator
+        }
+
+        if (initData) {
+          await x3dhResponder(convId, initData);
+        } else {
+          // Become the initiator: fetch contact's key bundle and run X3DH
+          const bundle = await api.keys.getBundle(conversation.contact_id);
+          const myIkPub = (await SecureStore.getItemAsync('ik_pub'))!;
+          const { ekPub, opkId } = await x3dhInitiator(convId, bundle);
+
+          try {
+            await api.keys.postX3DHInit(convId, { ikPub: myIkPub, ekPub, opkId });
+          } catch (err: any) {
+            if (err.message === 'X3DH init already exists') {
+              // Race: the other party posted first — re-fetch and become responder
+              const lateInit = await api.keys.getX3DHInit(convId);
+              await x3dhResponder(convId, lateInit);
+            } else {
+              throw err;
+            }
+          }
+        }
+
+        setHasKey(true);
+        setKeyStatus('ready');
+      } catch (err: any) {
+        console.error('[X3DH] Session establishment failed', err.message);
+        setKeyStatus('error');
+      }
+
       await loadMessages();
     })();
 
@@ -86,77 +134,7 @@ export default function ChatScreen({ conversation, onBack }: Props) {
     return () => offNewMessage();
   }, [convId]);
 
-  // ── Clé : A génère et partage ─────────────────────────────────────────────
-  const handleGenerateAndShare = async () => {
-    const key = await generateConversationKey();
-    await storeConversationKey(convId, key);
-    setHasKey(true);
-    setIsInitiator(true);
-    await Clipboard.setStringAsync(key);
-    await loadMessages();
-
-    Alert.alert(
-      '🔑 Clé copiée !',
-      'La clé est dans votre presse-papier.\n\nEnvoyez-la à votre contact (Signal, SMS, appel…).\n\nIl devra appuyer sur "J\'ai reçu une clé" et coller.',
-      [
-        { text: 'Copier à nouveau', onPress: () => Clipboard.setStringAsync(key) },
-        { text: 'OK', style: 'default' },
-      ]
-    );
-  };
-
-  // ── Clé : B entre la clé reçue ────────────────────────────────────────────
-  const handleEnterReceivedKey = () => {
-    Alert.prompt(
-      '🔑 Coller la clé reçue',
-      'Collez la clé que votre contact vous a envoyée :',
-      async (key) => {
-        if (!key?.trim()) return;
-        await storeConversationKey(convId, key.trim());
-        setHasKey(true);
-        setIsInitiator(false);
-        await loadMessages();
-        Alert.alert('✅ Clé enregistrée', 'Vous pouvez maintenant lire et envoyer des messages.');
-      },
-      'plain-text'
-    );
-  };
-
-  // ── Régénérer la clé (si ça n'a pas marché) ──────────────────────────────
-  const handleKeyMenu = () => {
-    Alert.alert(
-      '🔑 Gestion de la clé',
-      'Que souhaitez-vous faire ?',
-      [
-        {
-          text: 'Régénérer une nouvelle clé',
-          onPress: () => {
-            Alert.alert(
-              'Régénérer ?',
-              'Attention : les anciens messages ne seront plus lisibles. Continuer ?',
-              [
-                { text: 'Annuler', style: 'cancel' },
-                { text: 'Régénérer', style: 'destructive', onPress: handleGenerateAndShare },
-              ]
-            );
-          },
-        },
-        { text: 'Entrer une clé reçue', onPress: handleEnterReceivedKey },
-        { text: 'Copier la clé actuelle', onPress: async () => {
-          const key = await getConversationKey(convId);
-          if (key) {
-            await Clipboard.setStringAsync(key);
-            Alert.alert('📋 Copié', 'Clé copiée dans le presse-papier.');
-          } else {
-            Alert.alert('Aucune clé', 'Pas de clé enregistrée pour cette conversation.');
-          }
-        }},
-        { text: 'Annuler', style: 'cancel' },
-      ]
-    );
-  };
-
-  // ── Envoyer un message ────────────────────────────────────────────────────
+  // ── Send message ──────────────────────────────────────────────────────────
   const handleSend = async () => {
     if (!input.trim() || !hasKey || sending) return;
     const text = input.trim();
@@ -206,28 +184,30 @@ export default function ChatScreen({ conversation, onBack }: Props) {
           <Text style={styles.headerName}>
             {conversation.display_name || `+·······${conversation.phone_last4}`}
           </Text>
-          <Text style={styles.headerSub}>🔒 Chiffré de bout en bout</Text>
+          <Text style={styles.headerSub}>
+            {keyStatus === 'establishing' ? '🔄 Chiffrement en cours…'
+              : keyStatus === 'error'       ? '⚠️ Chiffrement non établi'
+              :                              '🔒 Chiffré de bout en bout'}
+          </Text>
         </View>
-        <TouchableOpacity onPress={handleKeyMenu} style={styles.keyBtnWrap}>
-          <Text style={styles.keyBtn}>🔑</Text>
-        </TouchableOpacity>
+        {keyStatus === 'establishing' && (
+          <ActivityIndicator color="#4f9eff" size="small" style={{ marginRight: 4 }} />
+        )}
       </View>
 
-      {/* Bannière si pas de clé */}
-      {!hasKey && (
-        <View style={styles.noBanner}>
-          <Text style={styles.noBannerTitle}>Aucune clé de chiffrement</Text>
-          <Text style={styles.noBannerText}>
-            Pour commencer, une personne génère la clé et l'envoie à l'autre.
+      {/* Statut clé */}
+      {keyStatus === 'establishing' && (
+        <View style={styles.statusBanner}>
+          <Text style={styles.statusText}>
+            Établissement du chiffrement de bout en bout…
           </Text>
-          <View style={styles.noBannerActions}>
-            <TouchableOpacity style={styles.btnPrimary} onPress={handleGenerateAndShare}>
-              <Text style={styles.btnText}>Je génère la clé</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.btnSecondary} onPress={handleEnterReceivedKey}>
-              <Text style={styles.btnText}>J'ai reçu une clé</Text>
-            </TouchableOpacity>
-          </View>
+        </View>
+      )}
+      {keyStatus === 'error' && (
+        <View style={[styles.statusBanner, styles.statusBannerError]}>
+          <Text style={styles.statusText}>
+            Impossible d'établir le chiffrement. Demandez à votre contact de rouvrir l'app.
+          </Text>
         </View>
       )}
 
@@ -250,7 +230,11 @@ export default function ChatScreen({ conversation, onBack }: Props) {
       <View style={styles.inputBar}>
         <TextInput
           style={[styles.textInput, !hasKey && styles.textInputDisabled]}
-          placeholder={hasKey ? 'Message…' : 'Échangez une clé d\'abord'}
+          placeholder={
+            keyStatus === 'establishing' ? 'Chiffrement en cours…'
+            : keyStatus === 'error'       ? 'Chiffrement non disponible'
+            :                              'Message…'
+          }
           placeholderTextColor="#444"
           value={input}
           onChangeText={setInput}
@@ -286,29 +270,12 @@ const styles = StyleSheet.create({
   headerInfo: { flex: 1 },
   headerName: { color: '#fff', fontSize: 16, fontWeight: '700' },
   headerSub: { color: '#3a7a3a', fontSize: 11, marginTop: 2 },
-  keyBtnWrap: { padding: 4 },
-  keyBtn: { fontSize: 22 },
-  noBanner: {
-    backgroundColor: '#1a0f00', borderBottomWidth: 1,
-    borderBottomColor: '#3a2000', padding: 20,
+  statusBanner: {
+    backgroundColor: '#0f1a2e', borderBottomWidth: 1,
+    borderBottomColor: '#1a2a4a', padding: 12,
   },
-  noBannerTitle: {
-    color: '#f90', fontSize: 15, fontWeight: '700',
-    textAlign: 'center', marginBottom: 6,
-  },
-  noBannerText: {
-    color: '#aaa', fontSize: 13, textAlign: 'center', marginBottom: 16, lineHeight: 18,
-  },
-  noBannerActions: { flexDirection: 'row', gap: 10, justifyContent: 'center' },
-  btnPrimary: {
-    backgroundColor: '#4f9eff', borderRadius: 10,
-    paddingHorizontal: 18, paddingVertical: 10, flex: 1, alignItems: 'center',
-  },
-  btnSecondary: {
-    backgroundColor: '#2a3a5a', borderRadius: 10,
-    paddingHorizontal: 18, paddingVertical: 10, flex: 1, alignItems: 'center',
-  },
-  btnText: { color: '#fff', fontSize: 13, fontWeight: '600' },
+  statusBannerError: { backgroundColor: '#1a0f00', borderBottomColor: '#3a2000' },
+  statusText: { color: '#aaa', fontSize: 12, textAlign: 'center', lineHeight: 17 },
   messageList: { padding: 16, paddingBottom: 8 },
   bubble: { maxWidth: '78%', borderRadius: 16, padding: 10, marginBottom: 8 },
   bubbleMine: { alignSelf: 'flex-end', backgroundColor: '#1a3a6a', borderBottomRightRadius: 4 },

@@ -8,6 +8,15 @@ jest.mock('../services/websocket', () => ({
   initWebSocket: jest.fn(),
 }));
 
+const mockRedis = {
+  incr: jest.fn().mockResolvedValue(1),
+  expire: jest.fn().mockResolvedValue(1),
+};
+jest.mock('../services/redis', () => ({
+  getRedis: () => mockRedis,
+  initRedis: jest.fn(),
+}));
+
 let app;
 
 beforeAll(async () => {
@@ -16,6 +25,8 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  mockRedis.incr.mockResolvedValue(1);
+  mockRedis.expire.mockResolvedValue(1);
   await pool.query('DELETE FROM otp_codes');
   await pool.query('DELETE FROM users');
 });
@@ -55,6 +66,17 @@ describe('POST /api/auth/request-otp', () => {
       .send({});
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Phone number required');
+  });
+
+  it('rate-limits after 5 OTP requests in 10 minutes', async () => {
+    mockRedis.incr.mockResolvedValueOnce(6);
+
+    const res = await request(app)
+      .post('/api/auth/request-otp')
+      .send({ phone: '+32471234567' });
+
+    expect(res.status).toBe(429);
+    expect(res.body.error).toMatch(/Too many OTP requests/);
   });
 });
 

@@ -2,7 +2,6 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate } = require('../middleware/auth');
-const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
 function deterministicPhoneHash(phone, pepper) {
@@ -25,23 +24,19 @@ router.post('/find', async (req, res) => {
     if (!phone) return res.status(400).json({ error: 'Phone required' });
 
     const cleaned = phone.replace(/\s+/g, '').replace(/-/g, '');
+    const searchHash = deterministicPhoneHash(cleaned, process.env.SERVER_PEPPER);
 
-    // We must compare against all stored phone hashes
-    const { rows: users } = await pool.query(
-      `SELECT id, phone_hash, phone_last4, display_name, public_key
-       FROM users WHERE deleted_at IS NULL`
+    const { rows } = await pool.query(
+      `SELECT id, phone_last4, display_name, public_key
+       FROM users
+       WHERE phone_hash = $1 AND deleted_at IS NULL AND id != $2`,
+      [searchHash, req.userId]
     );
 
-    const searchHash = deterministicPhoneHash(cleaned, process.env.SERVER_PEPPER);
-    let found = null;
-    for (const user of users) {
-      if (user.id === req.userId) continue;
-      if (user.phone_hash === searchHash) { found = user; break; }
-    }
-
-    if (!found) {
+    if (rows.length === 0) {
       return res.status(404).json({ error: 'User not found or not registered on ROPE' });
     }
+    const found = rows[0];
 
     // Ensure conversation exists (canonical order to avoid duplicates)
     const [a, b] = [req.userId, found.id].sort();

@@ -22,24 +22,22 @@ async function sendOtp(phoneNumber, otp) {
     return { success: true, dev: true };
   }
 
-  // Sprint 2: Infobip implementation
-  // const response = await fetch(`${process.env.INFOBIP_BASE_URL}/sms/2/text/advanced`, {
-  //   method: 'POST',
-  //   headers: {
-  //     'Authorization': `App ${process.env.INFOBIP_API_KEY}`,
-  //     'Content-Type': 'application/json',
-  //   },
-  //   body: JSON.stringify({
-  //     messages: [{
-  //       from: 'ROPE',
-  //       destinations: [{ to: phoneNumber }],
-  //       text: `Your ROPE code: ${otp}. Valid 5 minutes. Never share it.`,
-  //     }],
-  //   }),
-  // });
-  // if (!response.ok) throw new Error('SMS delivery failed');
-
-  throw new Error('SMS provider not configured. Set OTP_BYPASS_ENABLED=true for development.');
+  const response = await fetch(`${process.env.INFOBIP_BASE_URL}/sms/2/text/advanced`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `App ${process.env.INFOBIP_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messages: [{
+        from: 'ROPE',
+        destinations: [{ to: phoneNumber }],
+        text: `Your ROPE code: ${otp}. Valid 5 minutes. Never share it.`,
+      }],
+    }),
+  });
+  if (!response.ok) throw new Error('SMS delivery failed');
+  return { success: true };
 }
 
 module.exports = { sendOtp };

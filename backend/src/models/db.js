@@ -55,10 +55,40 @@ const SCHEMA = `
     deleted_at TIMESTAMPTZ            -- GDPR: soft delete, purged after 30 days
   );
 
+  -- Device keys for X3DH (Sprint 2)
+  CREATE TABLE IF NOT EXISTS device_keys (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    ik_pub TEXT NOT NULL,
+    ik_signing_pub TEXT NOT NULL,
+    spk_pub TEXT NOT NULL,
+    spk_sig TEXT NOT NULL,
+    spk_id INTEGER NOT NULL DEFAULT 1,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  -- One-time prekeys, consumed one per X3DH session
+  CREATE TABLE IF NOT EXISTS one_time_prekeys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    key_id INTEGER NOT NULL,
+    opk_pub TEXT NOT NULL,
+    UNIQUE(user_id, key_id)
+  );
+
+  -- X3DH session init stored by the initiator for the responder to fetch
+  CREATE TABLE IF NOT EXISTS x3dh_sessions (
+    conversation_id UUID PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    initiator_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ik_pub TEXT NOT NULL,
+    ek_pub TEXT NOT NULL,
+    opk_id INTEGER
+  );
+
   -- Indexes
   CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sent_at DESC);
   CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
   CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_codes(phone_hash, expires_at);
+  CREATE INDEX IF NOT EXISTS idx_opk_user ON one_time_prekeys(user_id);
 `;
 
 async function initDB() {

@@ -8,6 +8,7 @@ const authRoutes = require('./routes/auth');
 const messageRoutes = require('./routes/messages');
 const contactRoutes = require('./routes/contacts');
 const accountRoutes = require('./routes/account');
+const keysRoutes = require('./routes/keys');
 
 function createApp() {
   const app = express();
@@ -15,7 +16,7 @@ function createApp() {
   app.use(helmet());
   app.use(cors({
     origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
-    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   }));
 
@@ -39,6 +40,7 @@ function createApp() {
   app.use('/api/messages', messageRoutes);
   app.use('/api/contacts', contactRoutes);
   app.use('/api/account', accountRoutes);
+  app.use('/api/keys', keysRoutes);
 
   app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 

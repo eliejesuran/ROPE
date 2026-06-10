@@ -75,4 +75,30 @@ export const api = {
         body: JSON.stringify({ displayName }),
       }),
   },
+
+  keys: {
+    uploadBundle: (bundle: {
+      ikPub: string; ikSigningPub: string;
+      spkPub: string; spkSig: string; spkId: number;
+      oneTimePreKeys: Array<{ id: number; pub: string }>;
+    }) => request('/api/keys/bundle', { method: 'PUT', body: JSON.stringify(bundle) }),
+
+    getBundle: (userId: string) =>
+      request<{
+        userId: string; ikPub: string; ikSigningPub: string;
+        spkPub: string; spkSig: string; spkId: number;
+        opk: { id: number; pub: string } | null;
+      }>(`/api/keys/bundle/${userId}`),
+
+    postX3DHInit: (conversationId: string, data: { ikPub: string; ekPub: string; opkId: number | null }) =>
+      request('/api/keys/x3dh-init', {
+        method: 'POST',
+        body: JSON.stringify({ conversationId, ...data }),
+      }),
+
+    getX3DHInit: (conversationId: string) =>
+      request<{ initiatorId: string; ikPub: string; ekPub: string; opkId: number | null }>(
+        `/api/keys/x3dh-init/${conversationId}`
+      ),
+  },
 };

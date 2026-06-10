@@ -1,7 +1,11 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import * as SecureStore from 'expo-secure-store';
 import { api } from './api';
-import { getOrCreateDeviceKeypair } from './crypto';
+import {
+  getOrCreateDeviceKeypair,
+  getOrCreateSignedPreKey,
+  generateOneTimePreKeys,
+} from './crypto';
 import { connectSocket, disconnectSocket } from './socket';
 
 interface User {
@@ -62,6 +66,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
+  async function uploadKeyBundle(ikPub: string) {
+    const spk  = await getOrCreateSignedPreKey();
+    // Generate OPKs only once per device — the flag prevents re-upload on every login
+    const uploaded = await SecureStore.getItemAsync('opks_uploaded');
+    const opks = uploaded ? [] : await generateOneTimePreKeys(10);
+    await api.keys.uploadBundle({
+      ikPub,
+      ikSigningPub:  spk.ikSigningPub,
+      spkPub:        spk.spkPub,
+      spkSig:        spk.spkSig,
+      spkId:         spk.spkId,
+      oneTimePreKeys: opks,
+    });
+    if (!uploaded) await SecureStore.setItemAsync('opks_uploaded', 'true');
+  }
+
   const requestOtp = async (phone: string) => {
     const result = await api.auth.requestOtp(phone);
     return { devCode: result.devCode };
@@ -75,9 +95,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await SecureStore.setItemAsync('user_data', JSON.stringify(result.user));
     setUser(result.user);
 
-    // Socket is best-effort — login succeeds even if real-time is unavailable
     connectSocket().catch((err) => {
       console.warn('[Auth] Socket connect failed after login:', err.message);
+    });
+
+    // Upload X3DH key bundle — best-effort, OPKs generated once per device
+    uploadKeyBundle(publicKey).catch((err) => {
+      console.warn('[Auth] Key bundle upload failed:', err.message);
     });
   };
 

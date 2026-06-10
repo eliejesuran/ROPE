@@ -47,6 +47,9 @@ services:
       OTP_BYPASS_CODE: "123456"
       OTP_BYPASS_ENABLED: "true"
       SERVER_PEPPER: dev_pepper_change_in_production_xxxxx
+      # Sprint 2 — set these in staging/prod (OTP_BYPASS_ENABLED=false)
+      INFOBIP_BASE_URL: ""
+      INFOBIP_API_KEY: ""
     ports:
       - "3000:3000"
     volumes:

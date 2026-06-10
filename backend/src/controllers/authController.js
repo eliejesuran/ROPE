@@ -41,8 +41,20 @@ exports.requestOtp = async (req, res) => {
     if (!phone) return res.status(400).json({ error: 'Phone number required' });
 
     const normalisedPhone = normalisePhone(phone);
-    // Use deterministic hash so the same phone always maps to the same record
     const phoneHash = deterministicPhoneHash(normalisedPhone, process.env.SERVER_PEPPER);
+
+    // Rate limit: 5 OTP requests per phone per 10 minutes (fail-open if Redis unavailable)
+    try {
+      const redis = getRedis();
+      const rateLimitKey = `otp:ratelimit:${phoneHash}`;
+      const count = await redis.incr(rateLimitKey);
+      if (count === 1) await redis.expire(rateLimitKey, 600);
+      if (count > 5) {
+        return res.status(429).json({ error: 'Too many OTP requests. Try again in 10 minutes.' });
+      }
+    } catch (err) {
+      logger.warn('Redis rate-limit unavailable', { error: err.message });
+    }
 
     // Generate OTP (bypass in dev mode)
     const otp = process.env.OTP_BYPASS_ENABLED === 'true'
