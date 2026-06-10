@@ -1,15 +1,24 @@
 /**
- * ROPE Crypto — AES-256-GCM via Web Crypto API (Hermes / RN 0.73+)
- * All encryption happens on-device. Server never sees plaintext or keys.
+ * ROPE Crypto — AES-256-GCM via node-forge (pure JS).
+ *
+ * globalThis.crypto.subtle is not reliably available in all React Native /
+ * Hermes configurations. node-forge ships as a pure-JS library, requires no
+ * native module, and is already a transitive dependency of the project.
+ *
+ * Public API is identical to the original — drop-in replacement.
+ * Ciphertext layout: base64(cipher_bytes ‖ 16-byte GCM auth tag)
+ * This matches Web Crypto AES-GCM output so stored messages stay readable.
  */
 
 import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
+import * as forge from 'node-forge';
 
 const KEY_SIZE = 32; // 256 bits
 const IV_SIZE  = 12; // 96 bits — GCM standard
+const TAG_SIZE = 16; // 128 bits — GCM authentication tag
 
-// ── Key generation ─────────────────────────────────────────────────────────
+// ── Key generation ──────────────────────────────────────────────────────────
 
 export async function generateConversationKey(): Promise<string> {
   const keyBytes = await Crypto.getRandomBytesAsync(KEY_SIZE);
@@ -29,7 +38,7 @@ export async function getOrCreateDeviceKeypair(): Promise<{ publicKey: string }>
   return { publicKey: uint8ArrayToBase64(pub) };
 }
 
-// ── Conversation key storage ───────────────────────────────────────────────
+// ── Conversation key storage ────────────────────────────────────────────────
 
 export async function storeConversationKey(conversationId: string, key: string): Promise<void> {
   await SecureStore.setItemAsync(`conv_key_${conversationId}`, key);
@@ -39,13 +48,7 @@ export async function getConversationKey(conversationId: string): Promise<string
   return SecureStore.getItemAsync(`conv_key_${conversationId}`);
 }
 
-// ── AES-256-GCM ────────────────────────────────────────────────────────────
-
-async function importAesKey(base64: string, usage: 'encrypt' | 'decrypt'): Promise<CryptoKey> {
-  return globalThis.crypto.subtle.importKey(
-    'raw', base64ToUint8Array(base64), { name: 'AES-GCM' }, false, [usage]
-  );
-}
+// ── AES-256-GCM ─────────────────────────────────────────────────────────────
 
 export async function encryptMessage(
   plaintext: string,
@@ -54,18 +57,19 @@ export async function encryptMessage(
   const keyBase64 = await getConversationKey(conversationId);
   if (!keyBase64) throw new Error('No key found for this conversation');
 
-  const iv  = await Crypto.getRandomBytesAsync(IV_SIZE);
-  const key = await importAesKey(keyBase64, 'encrypt');
+  const ivBytes = await Crypto.getRandomBytesAsync(IV_SIZE);
 
-  const encrypted = await globalThis.crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    new TextEncoder().encode(plaintext)
-  );
+  const cipher = forge.cipher.createCipher('AES-GCM', b64ToBin(keyBase64));
+  cipher.start({ iv: u8ToBin(ivBytes), tagLength: TAG_SIZE * 8 });
+  cipher.update(forge.util.createBuffer(forge.util.encodeUtf8(plaintext)));
+  cipher.finish();
+
+  // Append auth tag to ciphertext — matches Web Crypto AES-GCM layout
+  const payload = cipher.output.getBytes() + (cipher.mode as any).tag.getBytes();
 
   return {
-    ciphertext: uint8ArrayToBase64(new Uint8Array(encrypted)),
-    iv: uint8ArrayToBase64(iv),
+    ciphertext: binToB64(payload),
+    iv:         uint8ArrayToBase64(ivBytes),
   };
 }
 
@@ -77,28 +81,47 @@ export async function decryptMessage(
   const keyBase64 = await getConversationKey(conversationId);
   if (!keyBase64) throw new Error('No key found for this conversation');
 
-  const key = await importAesKey(keyBase64, 'decrypt');
+  const payload = b64ToBin(ciphertext);
 
-  const decrypted = await globalThis.crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: base64ToUint8Array(iv) },
-    key,
-    base64ToUint8Array(ciphertext)
-  );
+  if (payload.length < TAG_SIZE) {
+    throw new Error('Ciphertext too short to contain an authentication tag');
+  }
 
-  return new TextDecoder().decode(decrypted);
+  const cipherBytes = payload.slice(0, payload.length - TAG_SIZE);
+  const tag         = payload.slice(payload.length - TAG_SIZE);
+
+  const decipher = forge.cipher.createDecipher('AES-GCM', b64ToBin(keyBase64));
+  decipher.start({
+    iv:  b64ToBin(iv),
+    tag: forge.util.createBuffer(tag),
+  });
+  decipher.update(forge.util.createBuffer(cipherBytes));
+
+  if (!decipher.finish()) {
+    throw new Error('Decryption failed: authentication tag mismatch (wrong key or tampered data)');
+  }
+
+  return forge.util.decodeUtf8(decipher.output.getBytes());
 }
 
-// ── Utils ──────────────────────────────────────────────────────────────────
+// ── Base64 / binary helpers ─────────────────────────────────────────────────
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  bytes.forEach(b => (binary += String.fromCharCode(b)));
-  return btoa(binary);
+  let bin = '';
+  bytes.forEach(b => (bin += String.fromCharCode(b)));
+  return btoa(bin);
 }
 
-function base64ToUint8Array(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes  = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+function u8ToBin(bytes: Uint8Array): string {
+  let bin = '';
+  bytes.forEach(b => (bin += String.fromCharCode(b)));
+  return bin;
+}
+
+function b64ToBin(base64: string): string {
+  return atob(base64);
+}
+
+function binToB64(bin: string): string {
+  return btoa(bin);
 }

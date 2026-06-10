@@ -1,19 +1,25 @@
 import { io, Socket } from 'socket.io-client';
 import * as SecureStore from 'expo-secure-store';
-import { AppState, AppStateStatus } from 'react-native';
+import { AppState } from 'react-native';
 
 const BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3000';
 
 let socket: Socket | null = null;
 
+// Module-level — added once, not on every connectSocket() call (fixes the listener leak)
+AppState.addEventListener('change', (state) => {
+  if (state === 'active' && socket && !socket.connected) {
+    console.log('[Socket] App active, reconnecting...');
+    socket.connect();
+  }
+});
+
 export async function connectSocket(): Promise<Socket> {
   const token = await SecureStore.getItemAsync('auth_token');
   if (!token) throw new Error('No auth token');
 
-  // Si déjà connecté, on garde
   if (socket?.connected) return socket;
 
-  // Si socket existe mais déconnecté, on détruit et recrée
   if (socket) {
     socket.removeAllListeners();
     socket.disconnect();
@@ -24,26 +30,26 @@ export async function connectSocket(): Promise<Socket> {
     auth: { token },
     transports: ['websocket'],
     reconnection: true,
-    reconnectionDelay: 1000,
-    reconnectionAttempts: Infinity, // reconnexion infinie
+    reconnectionDelay: 2000,
+    reconnectionAttempts: Infinity,
     timeout: 10000,
   });
 
-  // Reconnexion automatique quand l'app revient au premier plan
-  AppState.addEventListener('change', async (state: AppStateStatus) => {
-    if (state === 'active' && socket && !socket.connected) {
-      console.log('[Socket] App active, reconnecting...');
-      socket.connect();
-    }
-  });
-
   return new Promise((resolve, reject) => {
-    socket!.on('connect', () => {
+    // once — the handler fires at most once then is removed automatically.
+    // On connect_error we disconnect immediately so socket.io stops retrying
+    // with a token that will never become valid.
+    socket!.once('connect', () => {
       console.log('[Socket] Connected:', socket!.id);
       resolve(socket!);
     });
-    socket!.on('connect_error', (err) => {
+
+    socket!.once('connect_error', (err) => {
       console.error('[Socket] Connection error:', err.message);
+      if (socket) {
+        socket.disconnect();
+        socket = null;
+      }
       reject(err);
     });
   });
@@ -61,7 +67,7 @@ export function disconnectSocket() {
 
 export function onNewMessage(callback: (msg: any) => void) {
   if (!socket) return;
-  socket.off('message:new'); // évite les doublons
+  socket.off('message:new');
   socket.on('message:new', callback);
 }
 

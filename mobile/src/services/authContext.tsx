@@ -33,13 +33,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         if (token && userData) {
           const parsed = JSON.parse(userData);
-          setUser(parsed);
-          // Connecter le socket avec le token existant — pas de nouvel OTP
           try {
             await connectSocket();
+            // Socket OK — restore session
+            setUser(parsed);
             console.log('[Auth] Session restored for userId:', parsed.id);
-          } catch (err) {
-            console.warn('[Auth] Socket connect failed, will retry on interaction');
+          } catch (err: any) {
+            const isAuthError = err?.message === 'Invalid token' || err?.message === 'Authentication required';
+            if (isAuthError) {
+              // Server rejected the token — clear everything, go to login
+              console.warn('[Auth] Token rejected by server, clearing session');
+              await SecureStore.deleteItemAsync('auth_token');
+              await SecureStore.deleteItemAsync('user_data');
+            } else {
+              // Network error — keep session, REST calls will still work
+              setUser(parsed);
+              console.warn('[Auth] Socket unavailable, continuing without real-time');
+            }
           }
         }
       } catch (err) {
@@ -61,12 +71,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const { publicKey } = await getOrCreateDeviceKeypair();
     const result = await api.auth.verifyOtp(phone, code, publicKey);
 
-    // Persister le token et les données utilisateur
     await SecureStore.setItemAsync('auth_token', result.token);
     await SecureStore.setItemAsync('user_data', JSON.stringify(result.user));
-
     setUser(result.user);
-    await connectSocket();
+
+    // Socket is best-effort — login succeeds even if real-time is unavailable
+    connectSocket().catch((err) => {
+      console.warn('[Auth] Socket connect failed after login:', err.message);
+    });
   };
 
   const logout = async () => {
