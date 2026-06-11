@@ -91,7 +91,10 @@ export default function ChatScreen({ conversation, onBack }: Props) {
   const loadMessages = useCallback(async () => {
     try {
       const { messages: raw } = await api.messages.get(convId);
-      const decrypted = await Promise.all(raw.map(decrypt));
+      const decrypted: Message[] = [];
+      for (const msg of raw) {
+        decrypted.push(await decrypt(msg));
+      }
       setMessages(decrypted);
     } catch (err: any) {
       console.error('Failed to load messages', err.message);
