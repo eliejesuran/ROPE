@@ -101,12 +101,29 @@ export default function ConversationListScreen({ onOpenConversation }: Props) {
     </TouchableOpacity>
   );
 
+  const handleExport = async () => {
+    try {
+      const data = await api.account.export();
+      const convCount = data.conversations.length;
+      const totalMsgs = data.conversations.reduce((s, c) => s + c.messageCount, 0);
+      Alert.alert(
+        'Export RGPD (Art. 20)',
+        `Compte créé le : ${new Date(data.user.createdAt).toLocaleDateString('fr-BE')}\n` +
+        `Conversations : ${convCount}\nMessages envoyés : ${totalMsgs}\n\n${data.note}`,
+        [{ text: 'OK' }]
+      );
+    } catch (err: any) {
+      Alert.alert('Erreur', err.message);
+    }
+  };
+
   const handleMenu = () => {
     Alert.alert(
       'Menu',
       null,
       [
         { text: 'Se déconnecter', onPress: logout },
+        { text: 'Exporter mes données (RGPD)', onPress: handleExport },
         {
           text: 'Supprimer mon compte',
           style: 'destructive',

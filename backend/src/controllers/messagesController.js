@@ -1,16 +1,24 @@
 const { pool } = require('../models/db');
-const { getIO } = require('../services/websocket');
+const { getIO, isOnline } = require('../services/websocket');
+const { sendPushNotifications } = require('../services/push');
 const logger = require('../services/logger');
 
 // ── Send a message ────────────────────────────────────────────────────────────
 // The server ONLY receives ciphertext + IV. It cannot decrypt the message.
 exports.sendMessage = async (req, res) => {
   try {
-    const { conversationId, ciphertext, iv, ratchetHeader } = req.body;
+    const { conversationId, ciphertext, iv, ratchetHeader, expiresIn } = req.body;
     const senderId = req.userId;
 
     if (!conversationId || !ciphertext || !iv) {
       return res.status(400).json({ error: 'conversationId, ciphertext and iv are required' });
+    }
+
+    if (expiresIn !== undefined && expiresIn !== null) {
+      const ttl = Number(expiresIn);
+      if (!Number.isInteger(ttl) || ttl <= 0) {
+        return res.status(400).json({ error: 'expiresIn must be a positive integer (seconds)' });
+      }
     }
 
     // Verify sender is a participant in this conversation
@@ -27,20 +35,24 @@ exports.sendMessage = async (req, res) => {
     const conv = convRows[0];
 
     // Store ciphertext only — server is blind to content
+    const expiresAt = (expiresIn != null)
+      ? new Date(Date.now() + Number(expiresIn) * 1000).toISOString()
+      : null;
+
     const { rows: msgRows } = await pool.query(
-      `INSERT INTO messages (conversation_id, sender_id, ciphertext, iv, ratchet_header)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, sent_at`,
-      [conversationId, senderId, ciphertext, iv, ratchetHeader || null]
+      `INSERT INTO messages (conversation_id, sender_id, ciphertext, iv, ratchet_header, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, sent_at, expires_at`,
+      [conversationId, senderId, ciphertext, iv, ratchetHeader || null, expiresAt]
     );
 
     const message = msgRows[0];
 
-    // Push to recipient via WebSocket
     const recipientId = conv.participant_a === senderId
       ? conv.participant_b
       : conv.participant_a;
 
+    // Real-time delivery via WebSocket
     const io = getIO();
     io.to(`user:${recipientId}`).emit('message:new', {
       id: message.id,
@@ -50,11 +62,28 @@ exports.sendMessage = async (req, res) => {
       iv,
       ratchetHeader: ratchetHeader || null,
       sentAt: message.sent_at,
+      expiresAt: message.expires_at,
     });
+
+    // Push notification if recipient is offline
+    if (!isOnline(recipientId)) {
+      const { rows: tokenRows } = await pool.query(
+        'SELECT token FROM device_tokens WHERE user_id = $1',
+        [recipientId]
+      );
+      if (tokenRows.length > 0) {
+        const tokens = tokenRows.map(r => r.token);
+        sendPushNotifications(tokens, {
+          title: 'Nouveau message',
+          body: 'Vous avez reçu un message chiffré.',
+          data: { conversationId },
+        }).catch(err => logger.error('Push notification failed', { error: err.message }));
+      }
+    }
 
     logger.info('Message stored', { messageId: message.id, conversationId });
 
-    res.status(201).json({ id: message.id, sentAt: message.sent_at });
+    res.status(201).json({ id: message.id, sentAt: message.sent_at, expiresAt: message.expires_at });
   } catch (err) {
     logger.error('sendMessage error', { error: err.message });
     res.status(500).json({ error: 'Failed to send message' });
@@ -78,10 +107,11 @@ exports.getMessages = async (req, res) => {
     if (!convRows.length) return res.status(403).json({ error: 'Forbidden' });
 
     const { rows: messages } = await pool.query(
-      `SELECT id, sender_id, ciphertext, iv, ratchet_header, sent_at, delivered_at, read_at
+      `SELECT id, sender_id, ciphertext, iv, ratchet_header, sent_at, delivered_at, read_at, expires_at
        FROM messages
        WHERE conversation_id = $1
          AND deleted_at IS NULL
+         AND (expires_at IS NULL OR expires_at > NOW())
          ${before ? 'AND sent_at < $3' : ''}
        ORDER BY sent_at DESC
        LIMIT $2`,

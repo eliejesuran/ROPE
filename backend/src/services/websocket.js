@@ -3,6 +3,12 @@ const jwt = require('jsonwebtoken');
 const logger = require('./logger');
 
 let io;
+const onlineUsers = new Map(); // userId → Set of socketIds
+
+function isOnline(userId) {
+  const sockets = onlineUsers.get(userId);
+  return sockets ? sockets.size > 0 : false;
+}
 
 function initWebSocket(server) {
   io = new Server(server, {
@@ -26,8 +32,9 @@ function initWebSocket(server) {
   });
 
   io.on('connection', (socket) => {
-    // Each user joins their own room for targeted delivery
     socket.join(`user:${socket.userId}`);
+    if (!onlineUsers.has(socket.userId)) onlineUsers.set(socket.userId, new Set());
+    onlineUsers.get(socket.userId).add(socket.id);
     logger.info('Client connected', { userId: socket.userId });
 
     socket.on('message:read', async ({ messageId, conversationId }) => {
@@ -45,6 +52,11 @@ function initWebSocket(server) {
     });
 
     socket.on('disconnect', () => {
+      const sockets = onlineUsers.get(socket.userId);
+      if (sockets) {
+        sockets.delete(socket.id);
+        if (sockets.size === 0) onlineUsers.delete(socket.userId);
+      }
       logger.info('Client disconnected', { userId: socket.userId });
     });
   });
@@ -57,4 +69,4 @@ function getIO() {
   return io;
 }
 
-module.exports = { initWebSocket, getIO };
+module.exports = { initWebSocket, getIO, isOnline };

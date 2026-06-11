@@ -9,6 +9,7 @@ const messageRoutes = require('./routes/messages');
 const contactRoutes = require('./routes/contacts');
 const accountRoutes = require('./routes/account');
 const keysRoutes = require('./routes/keys');
+const pushRoutes = require('./routes/push');
 
 function createApp() {
   const app = express();
@@ -41,6 +42,7 @@ function createApp() {
   app.use('/api/contacts', contactRoutes);
   app.use('/api/account', accountRoutes);
   app.use('/api/keys', keysRoutes);
+  app.use('/api/push', pushRoutes);
 
   app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 

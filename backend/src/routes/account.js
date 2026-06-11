@@ -45,6 +45,54 @@ router.delete('/', async (req, res) => {
   }
 });
 
+// GDPR Art. 20 — data export (metadata only, content is E2E encrypted)
+router.get('/export', async (req, res) => {
+  const userId = req.userId;
+  try {
+    const { rows: userRows } = await pool.query(
+      'SELECT id, phone_last4, display_name, created_at FROM users WHERE id = $1 AND deleted_at IS NULL',
+      [userId]
+    );
+    if (userRows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const u = userRows[0];
+
+    const { rows: convRows } = await pool.query(
+      `SELECT c.id, c.created_at AS started_at,
+              other.phone_last4 AS contact_last4,
+              other.display_name AS contact_display_name,
+              COUNT(m.id) FILTER (WHERE m.deleted_at IS NULL) AS message_count
+       FROM conversations c
+       JOIN users other ON other.id = CASE WHEN c.participant_a = $1 THEN c.participant_b ELSE c.participant_a END
+       LEFT JOIN messages m ON m.conversation_id = c.id
+       WHERE (c.participant_a = $1 OR c.participant_b = $1)
+       GROUP BY c.id, c.created_at, other.phone_last4, other.display_name
+       ORDER BY c.created_at`,
+      [userId]
+    );
+
+    res.json({
+      exportedAt: new Date().toISOString(),
+      user: {
+        id: u.id,
+        phoneLast4: u.phone_last4,
+        displayName: u.display_name,
+        createdAt: u.created_at,
+      },
+      conversations: convRows.map(c => ({
+        id: c.id,
+        contactLast4: c.contact_last4,
+        contactDisplayName: c.contact_display_name,
+        startedAt: c.started_at,
+        messageCount: parseInt(c.message_count),
+      })),
+      note: 'Les messages sont chiffrés de bout en bout — le serveur ne conserve jamais le contenu en clair.',
+    });
+  } catch (err) {
+    logger.error('account/export error', { error: err.message });
+    res.status(500).json({ error: 'Export failed' });
+  }
+});
+
 // Update display name (optional)
 router.patch('/display-name', async (req, res) => {
   const { displayName } = req.body;

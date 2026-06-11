@@ -6,6 +6,7 @@ const { createUserAndLogin } = require('./helpers/auth');
 jest.mock('../services/websocket', () => ({
   getIO: () => ({ to: () => ({ emit: jest.fn() }) }),
   initWebSocket: jest.fn(),
+  isOnline: jest.fn().mockReturnValue(true),
 }));
 
 let app;
@@ -101,6 +102,59 @@ describe('DELETE /api/account', () => {
 
   it('requires authentication', async () => {
     const res = await request(app).delete('/api/account');
+    expect(res.status).toBe(401);
+  });
+});
+
+// ── GDPR data export ─────────────────────────────────────────────────────────
+
+describe('GET /api/account/export', () => {
+  it('returns user metadata and conversation list', async () => {
+    const { token: tokenA } = await createUserAndLogin(app, '+32471111111');
+    const { token: tokenB } = await createUserAndLogin(app, '+32472222222');
+
+    await request(app)
+      .post('/api/contacts/find')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .send({ phone: '+32472222222' });
+
+    const res = await request(app)
+      .get('/api/account/export')
+      .set('Authorization', `Bearer ${tokenA}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.user).toBeDefined();
+    expect(res.body.user.phoneLast4).toBe('1111');
+    expect(res.body.conversations).toHaveLength(1);
+    expect(res.body.conversations[0].contactLast4).toBe('2222');
+    expect(res.body.note).toMatch(/chiffr/);
+    expect(res.body.exportedAt).toBeDefined();
+  });
+
+  it('never includes ciphertext in the export', async () => {
+    const { token: tokenA } = await createUserAndLogin(app, '+32471111111');
+    const { token: tokenB } = await createUserAndLogin(app, '+32472222222');
+
+    const convRes = await request(app)
+      .post('/api/contacts/find')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .send({ phone: '+32472222222' });
+
+    await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .send({ conversationId: convRes.body.conversationId, ciphertext: 'c2VjcmV0', iv: 'aXY=' });
+
+    const res = await request(app)
+      .get('/api/account/export')
+      .set('Authorization', `Bearer ${tokenA}`);
+
+    expect(JSON.stringify(res.body)).not.toContain('c2VjcmV0');
+    expect(res.body.conversations[0].messageCount).toBe(1);
+  });
+
+  it('requires authentication', async () => {
+    const res = await request(app).get('/api/account/export');
     expect(res.status).toBe(401);
   });
 });

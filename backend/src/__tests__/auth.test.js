@@ -6,6 +6,7 @@ const { createUserAndLogin, TEST_PUBLIC_KEY } = require('./helpers/auth');
 jest.mock('../services/websocket', () => ({
   getIO: () => ({ to: () => ({ emit: jest.fn() }) }),
   initWebSocket: jest.fn(),
+  isOnline: jest.fn().mockReturnValue(true),
 }));
 
 const mockRedis = {

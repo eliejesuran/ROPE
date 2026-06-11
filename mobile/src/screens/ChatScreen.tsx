@@ -16,6 +16,13 @@ import {
 } from '../services/crypto';
 import { onNewMessage, offNewMessage, getSocket } from '../services/socket';
 
+const TTL_OPTIONS: Array<{ label: string; value: number | null }> = [
+  { label: '∞', value: null },
+  { label: '1h', value: 3600 },
+  { label: '24h', value: 86400 },
+  { label: '7j', value: 604800 },
+];
+
 interface Message {
   id: string;
   sender_id: string;
@@ -23,6 +30,7 @@ interface Message {
   iv: string;
   ratchet_header?: string | null;
   sent_at: string;
+  expires_at?: string | null;
   plaintext?: string;
   error?: boolean;
 }
@@ -40,11 +48,21 @@ interface Props {
 
 type KeyStatus = 'establishing' | 'ready' | 'error';
 
+function formatExpiry(expiresAt: string): string {
+  const ms = new Date(expiresAt).getTime() - Date.now();
+  if (ms <= 0) return 'expiré';
+  const secs = Math.floor(ms / 1000);
+  if (secs < 3600) return `${Math.floor(secs / 60)}min`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+  return `${Math.floor(secs / 86400)}j`;
+}
+
 export default function ChatScreen({ conversation, onBack }: Props) {
   const { user } = useAuth();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [ttlIndex, setTtlIndex] = useState(0);
   const [keyStatus, setKeyStatus] = useState<KeyStatus>('establishing');
   const [drReady, setDrReady] = useState(false);   // true when CKs exists (can send)
   const [loading, setLoading] = useState(true);
@@ -166,6 +184,7 @@ export default function ChatScreen({ conversation, onBack }: Props) {
         iv:             msg.iv,
         ratchet_header: msg.ratchetHeader ?? msg.ratchet_header ?? null,
         sent_at:        msg.sentAt || msg.sent_at,
+        expires_at:     msg.expiresAt ?? msg.expires_at ?? null,
       };
       const decrypted = await decrypt(normalised);
       setMessages(prev => [...prev, decrypted]);
@@ -185,10 +204,12 @@ export default function ChatScreen({ conversation, onBack }: Props) {
     try {
       const { ciphertext, iv, header } = await drEncrypt(convId, text);
       const ratchetHeader = JSON.stringify(header);
-      const { id, sentAt } = await api.messages.send(convId, ciphertext, iv, ratchetHeader);
+      const expiresIn = TTL_OPTIONS[ttlIndex].value;
+      const { id, sentAt, expiresAt } = await api.messages.send(convId, ciphertext, iv, ratchetHeader, expiresIn);
       setMessages(prev => [...prev, {
         id, sender_id: user!.id,
-        ciphertext, iv, ratchet_header: ratchetHeader, sent_at: sentAt, plaintext: text,
+        ciphertext, iv, ratchet_header: ratchetHeader, sent_at: sentAt,
+        expires_at: expiresAt, plaintext: text,
       }]);
       setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
     } catch (err: any) {
@@ -201,14 +222,20 @@ export default function ChatScreen({ conversation, onBack }: Props) {
 
   const renderMessage = ({ item }: { item: Message }) => {
     const isMine = item.sender_id === user?.id;
+    const expiryLabel = item.expires_at ? formatExpiry(item.expires_at) : null;
     return (
       <View style={[styles.bubble, isMine ? styles.bubbleMine : styles.bubbleTheirs]}>
         <Text style={[styles.bubbleText, item.error && styles.bubbleError]}>
           {item.plaintext ?? '…'}
         </Text>
-        <Text style={styles.bubbleTime}>
-          {new Date(item.sent_at).toLocaleTimeString('fr-BE', { hour: '2-digit', minute: '2-digit' })}
-        </Text>
+        <View style={styles.bubbleMeta}>
+          <Text style={styles.bubbleTime}>
+            {new Date(item.sent_at).toLocaleTimeString('fr-BE', { hour: '2-digit', minute: '2-digit' })}
+          </Text>
+          {expiryLabel && (
+            <Text style={styles.bubbleExpiry}>🔥 {expiryLabel}</Text>
+          )}
+        </View>
       </View>
     );
   };
@@ -282,6 +309,15 @@ export default function ChatScreen({ conversation, onBack }: Props) {
 
       {/* Input */}
       <View style={styles.inputBar}>
+        <TouchableOpacity
+          style={styles.ttlBtn}
+          onPress={() => setTtlIndex(i => (i + 1) % TTL_OPTIONS.length)}
+          disabled={!canTypeAndSend}
+        >
+          <Text style={[styles.ttlText, TTL_OPTIONS[ttlIndex].value && styles.ttlActive]}>
+            {TTL_OPTIONS[ttlIndex].value ? `🔥${TTL_OPTIONS[ttlIndex].label}` : '∞'}
+          </Text>
+        </TouchableOpacity>
         <TextInput
           style={[styles.textInput, !canTypeAndSend && styles.textInputDisabled]}
           placeholder={
@@ -337,7 +373,9 @@ const styles = StyleSheet.create({
   bubbleTheirs: { alignSelf: 'flex-start', backgroundColor: '#1a1a2e', borderBottomLeftRadius: 4 },
   bubbleText: { color: '#fff', fontSize: 15, lineHeight: 20 },
   bubbleError: { color: '#f66', fontStyle: 'italic' },
-  bubbleTime: { color: '#555', fontSize: 10, marginTop: 4, textAlign: 'right' },
+  bubbleMeta: { flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 6, marginTop: 4 },
+  bubbleTime: { color: '#555', fontSize: 10 },
+  bubbleExpiry: { color: '#c65', fontSize: 10 },
   inputBar: {
     flexDirection: 'row', alignItems: 'flex-end',
     padding: 12, gap: 8,
@@ -355,4 +393,11 @@ const styles = StyleSheet.create({
   },
   sendBtnDisabled: { backgroundColor: '#1a2a4a' },
   sendBtnText: { color: '#fff', fontSize: 18, fontWeight: '700' },
+  ttlBtn: {
+    width: 36, height: 36, borderRadius: 10,
+    backgroundColor: '#161622', borderWidth: 1, borderColor: '#2a2a40',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  ttlText: { color: '#555', fontSize: 12, fontWeight: '600' },
+  ttlActive: { color: '#c65' },
 });

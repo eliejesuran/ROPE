@@ -6,6 +6,11 @@ const { createUserAndLogin } = require('./helpers/auth');
 jest.mock('../services/websocket', () => ({
   getIO: () => ({ to: () => ({ emit: jest.fn() }) }),
   initWebSocket: jest.fn(),
+  isOnline: jest.fn().mockReturnValue(true),
+}));
+
+jest.mock('../services/push', () => ({
+  sendPushNotifications: jest.fn().mockResolvedValue(undefined),
 }));
 
 let app;
@@ -125,6 +130,57 @@ describe('POST /api/messages', () => {
       .post('/api/messages')
       .send({ conversationId, ciphertext: 'abc', iv: 'def' });
     expect(res.status).toBe(401);
+  });
+});
+
+// ── Ephemeral messages ────────────────────────────────────────────────────────
+
+describe('POST /api/messages (ephemeral)', () => {
+  it('stores expires_at when expiresIn is provided', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${userA.token}`)
+      .send({ conversationId, ciphertext: 'dGVzdA==', iv: 'aXY=', expiresIn: 3600 });
+
+    expect(res.status).toBe(201);
+    expect(res.body.expiresAt).not.toBeNull();
+    const expiresAt = new Date(res.body.expiresAt);
+    expect(expiresAt.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('expiresAt is null when expiresIn is not provided', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${userA.token}`)
+      .send({ conversationId, ciphertext: 'dGVzdA==', iv: 'aXY=' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.expiresAt).toBeNull();
+  });
+
+  it('expired messages are excluded from GET results', async () => {
+    // Insert a message that expires in the past directly in DB
+    await pool.query(
+      `INSERT INTO messages (conversation_id, sender_id, ciphertext, iv, expires_at)
+       VALUES ($1, $2, 'YWJj', 'aXY=', NOW() - INTERVAL '1 second')`,
+      [conversationId, userA.user.id]
+    );
+
+    const res = await request(app)
+      .get(`/api/messages/${conversationId}`)
+      .set('Authorization', `Bearer ${userA.token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.messages).toHaveLength(0);
+  });
+
+  it('rejects non-positive expiresIn', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${userA.token}`)
+      .send({ conversationId, ciphertext: 'dGVzdA==', iv: 'aXY=', expiresIn: -1 });
+
+    expect(res.status).toBe(400);
   });
 });
 

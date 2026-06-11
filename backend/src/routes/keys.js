@@ -112,6 +112,29 @@ router.post('/x3dh-init', async (req, res) => {
   }
 });
 
+// ── Key status (OPK count + SPK age) for client-side rotation logic ──────────
+router.get('/status', async (req, res) => {
+  try {
+    const { rows: opkRows } = await pool.query(
+      'SELECT COUNT(*) AS count FROM one_time_prekeys WHERE user_id = $1',
+      [req.userId]
+    );
+    const { rows: spkRows } = await pool.query(
+      'SELECT spk_id, spk_created_at FROM device_keys WHERE user_id = $1',
+      [req.userId]
+    );
+
+    res.json({
+      opkCount: parseInt(opkRows[0].count),
+      spkId: spkRows.length > 0 ? spkRows[0].spk_id : null,
+      spkCreatedAt: spkRows.length > 0 ? spkRows[0].spk_created_at : null,
+    });
+  } catch (err) {
+    logger.error('keys/status error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch key status' });
+  }
+});
+
 // ── Fetch X3DH init (Bob retrieves Alice's params) ────────────────────────────
 router.get('/x3dh-init/:conversationId', async (req, res) => {
   try {

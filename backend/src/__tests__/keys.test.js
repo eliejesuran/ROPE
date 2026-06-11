@@ -6,6 +6,7 @@ const { createUserAndLogin } = require('./helpers/auth');
 jest.mock('../services/websocket', () => ({
   getIO: () => ({ to: () => ({ emit: jest.fn() }) }),
   initWebSocket: jest.fn(),
+  isOnline: jest.fn().mockReturnValue(true),
 }));
 
 jest.mock('../services/redis', () => ({
@@ -208,6 +209,46 @@ describe('POST /api/keys/x3dh-init', () => {
 
   it('requires authentication', async () => {
     const res = await request(app).post('/api/keys/x3dh-init').send({});
+    expect(res.status).toBe(401);
+  });
+});
+
+// ── GET /api/keys/status ──────────────────────────────────────────────────────
+
+describe('GET /api/keys/status', () => {
+  it('returns opkCount 0 and null spkId when no bundle uploaded', async () => {
+    const { token } = await createUserAndLogin(app, '+32471000001');
+
+    const res = await request(app)
+      .get('/api/keys/status')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.opkCount).toBe(0);
+    expect(res.body.spkId).toBeNull();
+    expect(res.body.spkCreatedAt).toBeNull();
+  });
+
+  it('returns correct opkCount and spkId after bundle upload', async () => {
+    const { token } = await createUserAndLogin(app, '+32471000001');
+
+    await request(app)
+      .put('/api/keys/bundle')
+      .set('Authorization', `Bearer ${token}`)
+      .send(BUNDLE);
+
+    const res = await request(app)
+      .get('/api/keys/status')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.opkCount).toBe(2);
+    expect(res.body.spkId).toBe(1);
+    expect(res.body.spkCreatedAt).not.toBeNull();
+  });
+
+  it('requires authentication', async () => {
+    const res = await request(app).get('/api/keys/status');
     expect(res.status).toBe(401);
   });
 });

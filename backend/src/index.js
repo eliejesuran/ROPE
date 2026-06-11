@@ -5,6 +5,7 @@ const logger = require('./services/logger');
 const { initDB } = require('./models/db');
 const { initRedis } = require('./services/redis');
 const { initWebSocket } = require('./services/websocket');
+const { startCronJobs } = require('./services/cron');
 const { createApp } = require('./app');
 
 const app = createApp();
@@ -21,6 +22,9 @@ async function start() {
 
     initWebSocket(server);
     logger.info('WebSocket initialized');
+
+    startCronJobs();
+    logger.info('Cron jobs started');
 
     const PORT = process.env.PORT || 3000;
     server.listen(PORT, () => {

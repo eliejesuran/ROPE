@@ -84,14 +84,32 @@ const SCHEMA = `
     opk_id INTEGER
   );
 
-  -- Double Ratchet header per message (Sprint 3)
+  -- Double Ratchet header per message (Sprint 2)
   ALTER TABLE messages ADD COLUMN IF NOT EXISTS ratchet_header TEXT;
+
+  -- Ephemeral messages (Sprint 3)
+  ALTER TABLE messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+
+  -- SPK rotation tracking (Sprint 3)
+  ALTER TABLE device_keys ADD COLUMN IF NOT EXISTS spk_created_at TIMESTAMPTZ DEFAULT NOW();
+
+  -- Push notification tokens (Sprint 3)
+  CREATE TABLE IF NOT EXISTS device_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+    token TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
 
   -- Indexes
   CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sent_at DESC);
   CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
+  CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_codes(phone_hash, expires_at);
   CREATE INDEX IF NOT EXISTS idx_opk_user ON one_time_prekeys(user_id);
+  CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);
 `;
 
 async function initDB() {

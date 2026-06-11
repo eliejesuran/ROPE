@@ -60,15 +60,21 @@ export const api = {
         `/api/messages/${conversationId}${before ? `?before=${before}` : ''}`
       ),
 
-    send: (conversationId: string, ciphertext: string, iv: string, ratchetHeader?: string) =>
-      request<{ id: string; sentAt: string }>('/api/messages', {
+    send: (conversationId: string, ciphertext: string, iv: string, ratchetHeader?: string, expiresIn?: number | null) =>
+      request<{ id: string; sentAt: string; expiresAt: string | null }>('/api/messages', {
         method: 'POST',
-        body: JSON.stringify({ conversationId, ciphertext, iv, ratchetHeader }),
+        body: JSON.stringify({ conversationId, ciphertext, iv, ratchetHeader, expiresIn: expiresIn ?? undefined }),
       }),
   },
 
   account: {
     delete: () => request('/api/account', { method: 'DELETE' }),
+    export: () => request<{
+      exportedAt: string;
+      user: { id: string; phoneLast4: string; displayName: string | null; createdAt: string };
+      conversations: Array<{ id: string; contactLast4: string; contactDisplayName: string | null; startedAt: string; messageCount: number }>;
+      note: string;
+    }>('/api/account/export'),
     updateDisplayName: (displayName: string) =>
       request('/api/account/display-name', {
         method: 'PATCH',
@@ -100,5 +106,23 @@ export const api = {
       request<{ initiatorId: string; ikPub: string; ekPub: string; opkId: number | null }>(
         `/api/keys/x3dh-init/${conversationId}`
       ),
+
+    getStatus: () =>
+      request<{ opkCount: number; spkId: number | null; spkCreatedAt: string | null }>(
+        '/api/keys/status'
+      ),
+  },
+
+  push: {
+    register: (token: string, platform: 'ios' | 'android') =>
+      request('/api/push/register', {
+        method: 'POST',
+        body: JSON.stringify({ token, platform }),
+      }),
+    unregister: (token: string) =>
+      request('/api/push/unregister', {
+        method: 'DELETE',
+        body: JSON.stringify({ token }),
+      }),
   },
 };

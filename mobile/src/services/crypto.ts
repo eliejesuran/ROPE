@@ -106,6 +106,34 @@ export async function getOrCreateSignedPreKey(): Promise<{
 }
 
 /**
+ * Generates a new signed prekey (SPK), replacing the previous one.
+ * Used for periodic SPK rotation (recommended every 7 days).
+ */
+export async function rotateSignedPreKey(): Promise<{
+  spkPub: string; spkSig: string; spkId: number; ikSigningPub: string;
+}> {
+  const sigPriv = b64ToU8((await SecureStore.getItemAsync('ik_signing_priv'))!);
+  const currentId = parseInt((await SecureStore.getItemAsync('spk_id')) || '1');
+  const newId = currentId + 1;
+
+  const spkPriv = await randomX25519PrivKey();
+  const spkPub  = x25519.getPublicKey(spkPriv);
+  const spkSig  = ed25519.sign(spkPub, sigPriv);
+
+  await SecureStore.setItemAsync('spk_priv', uint8ArrayToBase64(spkPriv));
+  await SecureStore.setItemAsync('spk_pub',  uint8ArrayToBase64(spkPub));
+  await SecureStore.setItemAsync('spk_sig',  uint8ArrayToBase64(spkSig));
+  await SecureStore.setItemAsync('spk_id',   String(newId));
+
+  return {
+    spkPub:       uint8ArrayToBase64(spkPub),
+    spkSig:       uint8ArrayToBase64(spkSig),
+    spkId:        newId,
+    ikSigningPub: (await SecureStore.getItemAsync('ik_signing_pub'))!,
+  };
+}
+
+/**
  * Generates `count` fresh one-time prekeys (OPKs) and stores their
  * private keys in SecureStore. Returns the public keys for server upload.
  */
