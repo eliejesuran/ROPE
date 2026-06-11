@@ -66,6 +66,16 @@ Flux de test complet :
 
 > **Sur réseau réel** : `ifconfig | grep "inet "` pour l'IP locale, ou `ngrok http 3000`.
 
+### ⚠️ Après tout `npm install` côté backend
+
+Le `docker-compose.yml` utilise un volume anonyme `/app/node_modules` pour le hot-reload. Ce volume est créé une fois et **ne se met pas à jour** lors d'un simple `docker compose up -d`, même après un rebuild de l'image. Si le backend démarre avec `Cannot find module '...'` :
+
+```bash
+docker compose rm -sf backend && docker compose up -d backend
+```
+
+Cela supprime le container **et** son volume anonyme, puis le recrée depuis la nouvelle image avec les bons modules.
+
 ---
 
 ## Structure des fichiers clés
