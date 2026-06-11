@@ -11,6 +11,8 @@ import {
   encryptMessage, decryptMessage,
   getConversationKey,
   x3dhInitiator, x3dhResponder,
+  hasDRState, drCanSend, drEncrypt, drDecrypt, initDRFromExistingSession,
+  type DRHeader,
 } from '../services/crypto';
 import { onNewMessage, offNewMessage, getSocket } from '../services/socket';
 
@@ -19,6 +21,7 @@ interface Message {
   sender_id: string;
   ciphertext: string;
   iv: string;
+  ratchet_header?: string | null;
   sent_at: string;
   plaintext?: string;
   error?: boolean;
@@ -42,20 +45,30 @@ export default function ChatScreen({ conversation, onBack }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
-  const [hasKey, setHasKey] = useState(false);
   const [keyStatus, setKeyStatus] = useState<KeyStatus>('establishing');
+  const [drReady, setDrReady] = useState(false);   // true when CKs exists (can send)
   const [loading, setLoading] = useState(true);
   const flatListRef = useRef<FlatList>(null);
   const convId = conversation.conversation_id;
 
-  const decrypt = async (msg: Message): Promise<Message> => {
+  // Decrypt one message — uses DR if ratchet_header present, legacy otherwise
+  const decrypt = useCallback(async (msg: Message): Promise<Message> => {
     try {
-      const plaintext = await decryptMessage(msg.ciphertext, msg.iv, convId);
+      let plaintext: string;
+      if (msg.ratchet_header) {
+        const header: DRHeader = JSON.parse(msg.ratchet_header);
+        plaintext = await drDecrypt(convId, msg.ciphertext, msg.iv, header);
+        // After DR decrypt, the responder may now have a sending chain
+        const canSend = await drCanSend(convId);
+        setDrReady(canSend);
+      } else {
+        plaintext = await decryptMessage(msg.ciphertext, msg.iv, convId);
+      }
       return { ...msg, plaintext };
     } catch {
       return { ...msg, plaintext: '[Clé incorrecte ou manquante]', error: true };
     }
-  };
+  }, [convId]);
 
   const loadMessages = useCallback(async () => {
     try {
@@ -67,36 +80,58 @@ export default function ChatScreen({ conversation, onBack }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [convId]);
+  }, [convId, decrypt]);
 
-  // ── Auto-establish X3DH session ───────────────────────────────────────────
+  // ── Session establishment (X3DH + DR) ────────────────────────────────────
   useEffect(() => {
     (async () => {
-      // If a key already exists (prior session or manual), use it directly
-      const existing = await getConversationKey(convId);
-      if (existing) {
-        setHasKey(true);
-        setKeyStatus('ready');
+      const existingKey = await getConversationKey(convId);
+
+      if (existingKey) {
+        // Session key exists — check if DR state is also present
+        if (await hasDRState(convId)) {
+          const canSend = await drCanSend(convId);
+          setDrReady(canSend);
+          setKeyStatus('ready');
+          await loadMessages();
+          return;
+        }
+
+        // Sprint-2 session exists but no DR state — migrate to Double Ratchet
+        setKeyStatus('establishing');
+        try {
+          let initData: { initiatorId: string; ikPub: string; ekPub: string; opkId: number | null } | null = null;
+          try { initData = await api.keys.getX3DHInit(convId); } catch { /* no init yet */ }
+
+          if (initData && initData.initiatorId === user!.id) {
+            const bundle = await api.keys.getBundle(conversation.contact_id);
+            await initDRFromExistingSession(convId, 'initiator', bundle.spkPub);
+          } else {
+            await initDRFromExistingSession(convId, 'responder');
+          }
+          setDrReady(await drCanSend(convId));
+          setKeyStatus('ready');
+        } catch (err: any) {
+          console.error('[DR migration] Failed', err.message);
+          setKeyStatus('error');
+        }
         await loadMessages();
         return;
       }
 
+      // No session at all — run X3DH to establish one
       setKeyStatus('establishing');
       try {
-        // Try as responder first: check if the other party already posted X3DH init
-        let initData: { ikPub: string; ekPub: string; opkId: number | null } | null = null;
-        try {
-          initData = await api.keys.getX3DHInit(convId);
-        } catch {
-          // 404 or 403 — no init exists yet, we become the initiator
-        }
+        let initData: { initiatorId: string; ikPub: string; ekPub: string; opkId: number | null } | null = null;
+        try { initData = await api.keys.getX3DHInit(convId); } catch { /* no init yet */ }
 
         if (initData) {
+          // Become responder: the other party already posted the X3DH init
           await x3dhResponder(convId, initData);
         } else {
-          // Become the initiator: fetch contact's key bundle and run X3DH
-          const bundle = await api.keys.getBundle(conversation.contact_id);
-          const myIkPub = (await SecureStore.getItemAsync('ik_pub'))!;
+          // Become initiator: fetch contact's bundle and post the X3DH init
+          const bundle   = await api.keys.getBundle(conversation.contact_id);
+          const myIkPub  = (await SecureStore.getItemAsync('ik_pub'))!;
           const { ekPub, opkId } = await x3dhInitiator(convId, bundle);
 
           try {
@@ -112,7 +147,7 @@ export default function ChatScreen({ conversation, onBack }: Props) {
           }
         }
 
-        setHasKey(true);
+        setDrReady(await drCanSend(convId));
         setKeyStatus('ready');
       } catch (err: any) {
         console.error('[X3DH] Session establishment failed', err.message);
@@ -124,7 +159,14 @@ export default function ChatScreen({ conversation, onBack }: Props) {
 
     onNewMessage(async (msg: any) => {
       if (msg.conversationId !== convId) return;
-      const normalised = { ...msg, sent_at: msg.sentAt || msg.sent_at };
+      const normalised: Message = {
+        id:             msg.id,
+        sender_id:      msg.senderId || msg.sender_id,
+        ciphertext:     msg.ciphertext,
+        iv:             msg.iv,
+        ratchet_header: msg.ratchetHeader ?? msg.ratchet_header ?? null,
+        sent_at:        msg.sentAt || msg.sent_at,
+      };
       const decrypted = await decrypt(normalised);
       setMessages(prev => [...prev, decrypted]);
       getSocket()?.emit('message:read', { messageId: msg.id, conversationId: convId });
@@ -136,16 +178,17 @@ export default function ChatScreen({ conversation, onBack }: Props) {
 
   // ── Send message ──────────────────────────────────────────────────────────
   const handleSend = async () => {
-    if (!input.trim() || !hasKey || sending) return;
+    if (!input.trim() || !drReady || sending) return;
     const text = input.trim();
     setInput('');
     setSending(true);
     try {
-      const { ciphertext, iv } = await encryptMessage(text, convId);
-      const { id, sentAt } = await api.messages.send(convId, ciphertext, iv);
+      const { ciphertext, iv, header } = await drEncrypt(convId, text);
+      const ratchetHeader = JSON.stringify(header);
+      const { id, sentAt } = await api.messages.send(convId, ciphertext, iv, ratchetHeader);
       setMessages(prev => [...prev, {
         id, sender_id: user!.id,
-        ciphertext, iv, sent_at: sentAt, plaintext: text,
+        ciphertext, iv, ratchet_header: ratchetHeader, sent_at: sentAt, plaintext: text,
       }]);
       setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
     } catch (err: any) {
@@ -170,6 +213,9 @@ export default function ChatScreen({ conversation, onBack }: Props) {
     );
   };
 
+  const isEstablished = keyStatus === 'ready';
+  const canTypeAndSend = isEstablished && drReady;
+
   return (
     <KeyboardAvoidingView
       style={styles.container}
@@ -186,8 +232,9 @@ export default function ChatScreen({ conversation, onBack }: Props) {
           </Text>
           <Text style={styles.headerSub}>
             {keyStatus === 'establishing' ? '🔄 Chiffrement en cours…'
-              : keyStatus === 'error'       ? '⚠️ Chiffrement non établi'
-              :                              '🔒 Chiffré de bout en bout'}
+              : keyStatus === 'error'      ? '⚠️ Chiffrement non établi'
+              : !drReady                   ? '⏳ En attente du premier message…'
+              :                             '🔒 Chiffré de bout en bout (Double Ratchet)'}
           </Text>
         </View>
         {keyStatus === 'establishing' && (
@@ -195,7 +242,7 @@ export default function ChatScreen({ conversation, onBack }: Props) {
         )}
       </View>
 
-      {/* Statut clé */}
+      {/* Statut */}
       {keyStatus === 'establishing' && (
         <View style={styles.statusBanner}>
           <Text style={styles.statusText}>
@@ -207,6 +254,13 @@ export default function ChatScreen({ conversation, onBack }: Props) {
         <View style={[styles.statusBanner, styles.statusBannerError]}>
           <Text style={styles.statusText}>
             Impossible d'établir le chiffrement. Demandez à votre contact de rouvrir l'app.
+          </Text>
+        </View>
+      )}
+      {isEstablished && !drReady && (
+        <View style={styles.statusBanner}>
+          <Text style={styles.statusText}>
+            En attente du premier message de votre contact pour activer l'envoi.
           </Text>
         </View>
       )}
@@ -229,24 +283,25 @@ export default function ChatScreen({ conversation, onBack }: Props) {
       {/* Input */}
       <View style={styles.inputBar}>
         <TextInput
-          style={[styles.textInput, !hasKey && styles.textInputDisabled]}
+          style={[styles.textInput, !canTypeAndSend && styles.textInputDisabled]}
           placeholder={
             keyStatus === 'establishing' ? 'Chiffrement en cours…'
             : keyStatus === 'error'       ? 'Chiffrement non disponible'
+            : !drReady                    ? 'En attente du premier message…'
             :                              'Message…'
           }
           placeholderTextColor="#444"
           value={input}
           onChangeText={setInput}
           multiline
-          editable={hasKey}
+          editable={canTypeAndSend}
           onSubmitEditing={handleSend}
           blurOnSubmit={false}
         />
         <TouchableOpacity
-          style={[styles.sendBtn, (!hasKey || !input.trim() || sending) && styles.sendBtnDisabled]}
+          style={[styles.sendBtn, (!canTypeAndSend || !input.trim() || sending) && styles.sendBtnDisabled]}
           onPress={handleSend}
-          disabled={!hasKey || !input.trim() || sending}
+          disabled={!canTypeAndSend || !input.trim() || sending}
         >
           {sending
             ? <ActivityIndicator color="#fff" size="small" />

@@ -84,6 +84,9 @@ const SCHEMA = `
     opk_id INTEGER
   );
 
+  -- Double Ratchet header per message (Sprint 3)
+  ALTER TABLE messages ADD COLUMN IF NOT EXISTS ratchet_header TEXT;
+
   -- Indexes
   CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sent_at DESC);
   CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);

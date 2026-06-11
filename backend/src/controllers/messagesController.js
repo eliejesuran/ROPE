@@ -6,7 +6,7 @@ const logger = require('../services/logger');
 // The server ONLY receives ciphertext + IV. It cannot decrypt the message.
 exports.sendMessage = async (req, res) => {
   try {
-    const { conversationId, ciphertext, iv } = req.body;
+    const { conversationId, ciphertext, iv, ratchetHeader } = req.body;
     const senderId = req.userId;
 
     if (!conversationId || !ciphertext || !iv) {
@@ -28,10 +28,10 @@ exports.sendMessage = async (req, res) => {
 
     // Store ciphertext only — server is blind to content
     const { rows: msgRows } = await pool.query(
-      `INSERT INTO messages (conversation_id, sender_id, ciphertext, iv)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO messages (conversation_id, sender_id, ciphertext, iv, ratchet_header)
+       VALUES ($1, $2, $3, $4, $5)
        RETURNING id, sent_at`,
-      [conversationId, senderId, ciphertext, iv]
+      [conversationId, senderId, ciphertext, iv, ratchetHeader || null]
     );
 
     const message = msgRows[0];
@@ -48,6 +48,7 @@ exports.sendMessage = async (req, res) => {
       senderId,
       ciphertext,
       iv,
+      ratchetHeader: ratchetHeader || null,
       sentAt: message.sent_at,
     });
 
@@ -77,7 +78,7 @@ exports.getMessages = async (req, res) => {
     if (!convRows.length) return res.status(403).json({ error: 'Forbidden' });
 
     const { rows: messages } = await pool.query(
-      `SELECT id, sender_id, ciphertext, iv, sent_at, delivered_at, read_at
+      `SELECT id, sender_id, ciphertext, iv, ratchet_header, sent_at, delivered_at, read_at
        FROM messages
        WHERE conversation_id = $1
          AND deleted_at IS NULL

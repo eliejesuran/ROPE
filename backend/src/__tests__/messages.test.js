@@ -44,6 +44,36 @@ describe('POST /api/messages', () => {
     expect(res.body.sentAt).toBeDefined();
   });
 
+  it('stores and returns ratchet_header (Double Ratchet)', async () => {
+    const header = JSON.stringify({ dh: 'dGVzdFB1YktleQ==', n: 0, pn: 0 });
+
+    const sendRes = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${userA.token}`)
+      .send({ conversationId, ciphertext: 'dGVzdA==', iv: 'aXY=', ratchetHeader: header });
+
+    expect(sendRes.status).toBe(201);
+
+    const getRes = await request(app)
+      .get(`/api/messages/${conversationId}`)
+      .set('Authorization', `Bearer ${userA.token}`);
+
+    expect(getRes.body.messages[0].ratchet_header).toBe(header);
+  });
+
+  it('ratchet_header is null when not provided (backward compatibility)', async () => {
+    await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${userA.token}`)
+      .send({ conversationId, ciphertext: 'dGVzdA==', iv: 'aXY=' });
+
+    const getRes = await request(app)
+      .get(`/api/messages/${conversationId}`)
+      .set('Authorization', `Bearer ${userA.token}`);
+
+    expect(getRes.body.messages[0].ratchet_header).toBeNull();
+  });
+
   it('server never stores or returns plaintext', async () => {
     const plaintext = 'super secret message';
     // Simulate: in real app, ciphertext would be AES-encrypted; here we use a string

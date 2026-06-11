@@ -60,10 +60,10 @@ export const api = {
         `/api/messages/${conversationId}${before ? `?before=${before}` : ''}`
       ),
 
-    send: (conversationId: string, ciphertext: string, iv: string) =>
+    send: (conversationId: string, ciphertext: string, iv: string, ratchetHeader?: string) =>
       request<{ id: string; sentAt: string }>('/api/messages', {
         method: 'POST',
-        body: JSON.stringify({ conversationId, ciphertext, iv }),
+        body: JSON.stringify({ conversationId, ciphertext, iv, ratchetHeader }),
       }),
   },
 

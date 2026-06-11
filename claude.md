@@ -14,7 +14,7 @@
 | Suppression de compte RGPD | ✅ | `backend/src/routes/account.js` |
 | Backend Node.js + PostgreSQL + Redis | ✅ | `backend/src/` + `docker-compose.yml` |
 | App React Native / Expo 54 | ✅ | `mobile/` |
-| Batterie de tests automatisés (86 tests) | ✅ | `backend/src/__tests__/` |
+| Batterie de tests automatisés (88 tests) | ✅ | `backend/src/__tests__/` |
 | Token invalide → auto-logout | ✅ | `mobile/src/services/authContext.tsx` |
 
 ## Sprint 2 — Terminé ✅
@@ -30,7 +30,7 @@
 | API keys (`/api/keys/bundle`, `/api/keys/x3dh-init`) | ✅ | `backend/src/routes/keys.js` |
 | Upload key bundle après login | ✅ | `mobile/src/services/authContext.tsx` |
 | Session X3DH auto à l'ouverture d'une conv | ✅ | `mobile/src/screens/ChatScreen.tsx` |
-| Double Ratchet (forward secrecy) | 🔜 Sprint 3 | |
+| Double Ratchet (forward secrecy par message) | ✅ | `mobile/src/services/crypto.ts` |
 
 ---
 
@@ -96,7 +96,7 @@ services/
 __tests__/
   auth.test.js              — 13 tests (+ rate-limit)
   contacts.test.js          — 11 tests
-  messages.test.js          — 15 tests
+  messages.test.js          — 17 tests (+ Double Ratchet header)
   account.test.js           — 9 tests
   keys.test.js              — 16 tests (bundle upload/fetch, x3dh-init)
   security.unit.test.js     — 11 tests (deterministicPhoneHash, normalisePhone)
@@ -110,12 +110,12 @@ __tests__/
 screens/
   AuthScreen.tsx                — login OTP
   ConversationListScreen.tsx    — liste conversations
-  ChatScreen.tsx                — messages, session X3DH auto-établie à l'ouverture
+  ChatScreen.tsx                — messages, X3DH auto à l'ouverture, chiffrement Double Ratchet
 services/
   api.ts                        — fetch wrapper, gestion token SecureStore + keys API
   authContext.tsx               — restore session, logout sur token invalide, upload key bundle
   socket.ts                     — socket.io client, reconnect sur AppState
-  crypto.ts                     — AES-256-GCM (node-forge) + X3DH Curve25519 (@noble/curves)
+  crypto.ts                     — AES-256-GCM (node-forge) + X3DH + Double Ratchet (@noble/curves, @noble/hashes)
 metro.config.js                 — unstable_enablePackageExports pour @noble/curves
 ```
 
@@ -133,13 +133,23 @@ iPhone A                         Serveur                        iPhone B
    │                    SK = HKDF(DH1‖DH2‖DH3‖DH4)                 │
    │                                │         X3DH(SPK_B,IK_B,EK_A) │
    │                                │                    même SK ←  │
-   │──encrypt(AES-256-GCM, SK)─────►│                               │
-   │                                │──ciphertext + IV─────────────►│
-   │                                │                               │──decrypt──► plaintext
+   │                                │                               │
+   │  ── Double Ratchet (par message) ──────────────────────────── │
+   │  header={dh, n, pn}            │                               │
+   │  MK = KDF_CK(CKs)             │                               │
+   │──encrypt(AES-256-GCM, MK)─────►│                               │
+   │                                │──ciphertext+iv+header────────►│
+   │                                │              MK=KDF_CK(CKr) ← │──decrypt──► plaintext
+   │                                │        DH ratchet si new dh ← │
 ```
 
-**Serveur stocke** : `HMAC-SHA256(phone, SERVER_PEPPER)` · clés publiques X3DH · `ciphertext` + `iv`  
-**Serveur ne voit jamais** : phone en clair · plaintext · clés privées · SK
+**Serveur stocke** : `HMAC-SHA256(phone, SERVER_PEPPER)` · clés publiques X3DH · `ciphertext` + `iv` + `ratchet_header`  
+**Serveur ne voit jamais** : phone en clair · plaintext · clés privées · SK · clés de message DR
+
+Double Ratchet — propriétés :
+- **Forward secrecy** : chaque message a sa propre clé dérivée via `HMAC-SHA256(CK, 0x01)`, effacée après usage
+- **Post-compromise security** : DH ratchet automatique à chaque réponse, renouvelle `RK`, `CKs`, `CKr`
+- **Messages hors-ordre** : cache des clés sautées jusqu'à 50 par chaîne
 
 Format ciphertext : `base64(cipher_bytes ‖ 16-byte GCM auth tag)` — compatible Web Crypto.
 
@@ -170,7 +180,6 @@ Format ciphertext : `base64(cipher_bytes ‖ 16-byte GCM auth tag)` — compatib
 
 ## Sprint 3 — Roadmap
 
-- Double Ratchet (forward secrecy par message)
 - Notifications push (APNs iOS, FCM Android)
 - Multi-appareils
 - Messages éphémères
