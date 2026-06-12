@@ -74,3 +74,21 @@ export function onNewMessage(callback: (msg: any) => void) {
 export function offNewMessage() {
   socket?.off('message:new');
 }
+
+// 'connect' fires again after every reconnection (e.g. app back from
+// background) — messages sent meanwhile were never delivered via socket,
+// so screens use this to trigger a catch-up fetch.
+let reconnectCb: (() => void) | null = null;
+
+export function onReconnect(callback: () => void) {
+  offReconnect();
+  reconnectCb = callback;
+  socket?.on('connect', callback);
+}
+
+export function offReconnect() {
+  if (reconnectCb) {
+    socket?.off('connect', reconnectCb);
+    reconnectCb = null;
+  }
+}

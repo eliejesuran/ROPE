@@ -20,7 +20,11 @@ router.put('/bundle', async (req, res) => {
        ON CONFLICT (user_id) DO UPDATE SET
          ik_pub = EXCLUDED.ik_pub, ik_signing_pub = EXCLUDED.ik_signing_pub,
          spk_pub = EXCLUDED.spk_pub, spk_sig = EXCLUDED.spk_sig,
-         spk_id = EXCLUDED.spk_id, updated_at = NOW()`,
+         spk_id = EXCLUDED.spk_id, updated_at = NOW(),
+         spk_created_at = CASE
+           WHEN device_keys.spk_id IS DISTINCT FROM EXCLUDED.spk_id THEN NOW()
+           ELSE device_keys.spk_created_at
+         END`,
       [req.userId, ikPub, ikSigningPub, spkPub, spkSig, spkId]
     );
 

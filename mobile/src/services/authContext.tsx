@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import * as SecureStore from 'expo-secure-store';
 import * as Notifications from 'expo-notifications';
+import Constants, { ExecutionEnvironment } from 'expo-constants';
 import { Platform } from 'react-native';
 import { api } from './api';
 import {
@@ -8,10 +9,19 @@ import {
   getOrCreateSignedPreKey,
   rotateSignedPreKey,
   generateOneTimePreKeys,
+  wipeAllCryptoState,
 } from './crypto';
+import { wipeMessageStore } from './messageStore';
 import { connectSocket, disconnectSocket } from './socket';
 
 const SPK_MAX_AGE_DAYS = 7;
+
+// Same normalisation as the backend so the owner check survives formatting
+// differences ("+32 475..." vs "+32475...").
+function normalisePhone(phone: string): string {
+  const stripped = phone.replace(/[\s\-.()]/g, '');
+  return stripped.startsWith('00') ? `+${stripped.slice(2)}` : stripped;
+}
 
 interface User {
   id: string;
@@ -126,6 +136,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   async function registerPushToken() {
     try {
+      // Remote push was removed from Expo Go in SDK 53+ — a development build
+      // (eas build --profile development) is required to test notifications.
+      if (Constants.executionEnvironment === ExecutionEnvironment.StoreClient) {
+        console.log('[Push] Expo Go ne supporte pas les push distants — build EAS requis');
+        return;
+      }
+
       const { status: existing } = await Notifications.getPermissionsAsync();
       let finalStatus = existing;
       if (existing !== 'granted') {
@@ -134,7 +151,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       if (finalStatus !== 'granted') return;
 
-      const { data: token } = await Notifications.getExpoPushTokenAsync();
+      const projectId = Constants.expoConfig?.extra?.eas?.projectId;
+      const { data: token } = await Notifications.getExpoPushTokenAsync(
+        projectId ? { projectId } : undefined
+      );
       const platform = Platform.OS === 'ios' ? 'ios' : 'android';
       await api.push.register(token, platform);
       await SecureStore.setItemAsync('push_token', token);
@@ -149,9 +169,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const verifyOtp = async (phone: string, code: string) => {
+    // A DIFFERENT account logging in on this device must never inherit the
+    // previous owner's crypto state: stale identity keys / ratchet states for
+    // shared conversation ids would desync sessions and leak local history.
+    const me    = normalisePhone(phone);
+    const owner = await SecureStore.getItemAsync('state_owner_phone');
+    if (owner !== null && owner !== me) {
+      console.log('[Auth] Different account on this device — wiping local crypto state');
+      await wipeAllCryptoState();
+      await wipeMessageStore();
+    }
+
     const { publicKey } = await getOrCreateDeviceKeypair();
     const result = await api.auth.verifyOtp(phone, code, publicKey);
 
+    await SecureStore.setItemAsync('state_owner_phone', me);
     await SecureStore.setItemAsync('auth_token', result.token);
     await SecureStore.setItemAsync('user_data', JSON.stringify(result.user));
     setUser(result.user);

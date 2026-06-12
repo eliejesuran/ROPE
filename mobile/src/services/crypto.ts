@@ -229,10 +229,13 @@ export async function x3dhResponder(
   const parts: Uint8Array[] = [new Uint8Array(32).fill(0xff), dh1, dh2, dh3];
   if (initData.opkId !== null) {
     const opkPrivStr = await SecureStore.getItemAsync(`opk_priv_${initData.opkId}`);
-    if (opkPrivStr) {
-      parts.push(x25519.getSharedSecret(b64ToU8(opkPrivStr), ekAPub)); // DH(OPK_B, EK_A)
-      await SecureStore.deleteItemAsync(`opk_priv_${initData.opkId}`); // OPK consumed
+    // A missing OPK private key would silently derive a DIFFERENT SK than the
+    // initiator's — every message would fail with no clear cause. Fail loudly.
+    if (!opkPrivStr) {
+      throw new Error(`X3DH: OPK ${initData.opkId} private key missing — cannot derive session`);
     }
+    parts.push(x25519.getSharedSecret(b64ToU8(opkPrivStr), ekAPub)); // DH(OPK_B, EK_A)
+    await SecureStore.deleteItemAsync(`opk_priv_${initData.opkId}`); // OPK consumed
   }
 
   const sk = hkdf(sha256, concatU8(...parts), undefined, 'ROPE_X3DH_v1', KEY_SIZE);
@@ -279,6 +282,18 @@ interface DRState {
 }
 
 const MAX_SKIP = 50; // max cached skipped message keys per chain
+
+// Per-conversation mutex — drEncrypt/drDecrypt load-modify-save the ratchet
+// state in SecureStore; two concurrent calls on the same conversation would
+// clobber each other's writes and desynchronise the chains permanently.
+const drLocks = new Map<string, Promise<void>>();
+
+function withDRLock<T>(convId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = drLocks.get(convId) ?? Promise.resolve();
+  const run  = prev.then(fn);
+  drLocks.set(convId, run.then(() => undefined, () => undefined));
+  return run;
+}
 
 // KDF_RK: new root key + new chain key from a DH output
 function kdfRK(rk: Uint8Array, dhOut: Uint8Array): { newRK: Uint8Array; newCK: Uint8Array } {
@@ -452,7 +467,14 @@ export async function initDRFromExistingSession(
  * Encrypt a plaintext message using the Double Ratchet.
  * Advances the sending chain key and returns the header needed for decryption.
  */
-export async function drEncrypt(
+export function drEncrypt(
+  convId: string,
+  plaintext: string
+): Promise<{ ciphertext: string; iv: string; header: DRHeader }> {
+  return withDRLock(convId, () => drEncryptUnlocked(convId, plaintext));
+}
+
+async function drEncryptUnlocked(
   convId: string,
   plaintext: string
 ): Promise<{ ciphertext: string; iv: string; header: DRHeader }> {
@@ -475,7 +497,16 @@ export async function drEncrypt(
  * Performs a DH ratchet step automatically when a new peer key is detected.
  * Handles out-of-order delivery via the skipped-message-key cache.
  */
-export async function drDecrypt(
+export function drDecrypt(
+  convId: string,
+  ciphertext: string,
+  iv: string,
+  header: DRHeader
+): Promise<string> {
+  return withDRLock(convId, () => drDecryptUnlocked(convId, ciphertext, iv, header));
+}
+
+async function drDecryptUnlocked(
   convId: string,
   ciphertext: string,
   iv: string,
@@ -517,12 +548,71 @@ export async function drDecrypt(
 
 // ── Conversation key storage (X3DH shared secret — kept for legacy decryption) ──
 
+// SecureStore cannot enumerate keys, so we track every conversation that has
+// crypto state in a registry — required to wipe everything on account deletion.
+async function registerConversation(conversationId: string): Promise<void> {
+  const raw = await SecureStore.getItemAsync('conv_registry');
+  const ids: string[] = raw ? JSON.parse(raw) : [];
+  if (!ids.includes(conversationId)) {
+    ids.push(conversationId);
+    await SecureStore.setItemAsync('conv_registry', JSON.stringify(ids));
+  }
+}
+
+export async function getRegisteredConversations(): Promise<string[]> {
+  const raw = await SecureStore.getItemAsync('conv_registry');
+  return raw ? JSON.parse(raw) : [];
+}
+
 export async function storeConversationKey(conversationId: string, key: string): Promise<void> {
   await SecureStore.setItemAsync(`conv_key_${conversationId}`, key);
+  await registerConversation(conversationId);
 }
 
 export async function getConversationKey(conversationId: string): Promise<string | null> {
   return SecureStore.getItemAsync(`conv_key_${conversationId}`);
+}
+
+/**
+ * Erases ALL crypto material from SecureStore: identity keys, SPK, OPKs,
+ * per-conversation session keys and ratchet states.
+ * Called on account deletion (GDPR) — a re-registration starts from scratch.
+ */
+export async function wipeAllCryptoState(): Promise<void> {
+  for (const convId of await getRegisteredConversations()) {
+    await SecureStore.deleteItemAsync(`conv_key_${convId}`);
+    await SecureStore.deleteItemAsync(`dr_${convId}`);
+  }
+
+  const rawNext = await SecureStore.getItemAsync('opk_next_id');
+  const nextId  = rawNext ? parseInt(rawNext) : 1;
+  for (let i = 1; i < nextId; i++) {
+    await SecureStore.deleteItemAsync(`opk_priv_${i}`);
+  }
+
+  const flatKeys = [
+    'ik_priv', 'ik_pub', 'ik_signing_priv', 'ik_signing_pub',
+    'spk_priv', 'spk_pub', 'spk_sig', 'spk_id',
+    'opk_next_id', 'opks_uploaded', 'conv_registry', 'state_owner_phone',
+  ];
+  for (const k of flatKeys) await SecureStore.deleteItemAsync(k);
+}
+
+// ── Generic AES-256-GCM helpers (used by the local message store) ─────────────
+
+export async function aesGcmEncryptString(
+  key: Uint8Array,
+  plaintext: string
+): Promise<{ ciphertext: string; iv: string }> {
+  return encryptWithMK(key, plaintext);
+}
+
+export async function aesGcmDecryptString(
+  key: Uint8Array,
+  ciphertext: string,
+  iv: string
+): Promise<string> {
+  return decryptWithMK(key, ciphertext, iv);
 }
 
 // ── AES-256-GCM (legacy — decrypts pre-DR messages stored without ratchet_header) ──

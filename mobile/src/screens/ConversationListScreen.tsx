@@ -5,6 +5,8 @@ import {
 } from 'react-native';
 import { api } from '../services/api';
 import { useAuth } from '../services/authContext';
+import { wipeAllCryptoState } from '../services/crypto';
+import { wipeMessageStore } from '../services/messageStore';
 import { onNewMessage } from '../services/socket';
 
 interface Conversation {
@@ -120,7 +122,7 @@ export default function ConversationListScreen({ onOpenConversation }: Props) {
   const handleMenu = () => {
     Alert.alert(
       'Menu',
-      null,
+      undefined,
       [
         { text: 'Se déconnecter', onPress: logout },
         { text: 'Exporter mes données (RGPD)', onPress: handleExport },
@@ -139,6 +141,11 @@ export default function ConversationListScreen({ onOpenConversation }: Props) {
                   onPress: async () => {
                     try {
                       await api.account.delete();
+                      // GDPR: wipe ALL local crypto state + decrypted history.
+                      // A re-registration must start from a clean slate — stale
+                      // identity keys / ratchet states would desync new sessions.
+                      await wipeAllCryptoState();
+                      await wipeMessageStore();
                       await logout();
                     } catch (err: any) {
                       Alert.alert('Erreur', err.message);

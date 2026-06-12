@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, FlatList, TextInput, TouchableOpacity,
   StyleSheet, KeyboardAvoidingView, Platform, Alert,
-  ActivityIndicator,
+  ActivityIndicator, AppState,
 } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { api } from '../services/api';
@@ -14,7 +14,8 @@ import {
   hasDRState, drCanSend, drEncrypt, drDecrypt, initDRFromExistingSession,
   type DRHeader,
 } from '../services/crypto';
-import { onNewMessage, offNewMessage, getSocket } from '../services/socket';
+import { getPlaintext, setPlaintext } from '../services/messageStore';
+import { onNewMessage, offNewMessage, onReconnect, offReconnect, getSocket } from '../services/socket';
 
 const TTL_OPTIONS: Array<{ label: string; value: number | null }> = [
   { label: '∞', value: null },
@@ -69,8 +70,20 @@ export default function ChatScreen({ conversation, onBack }: Props) {
   const flatListRef = useRef<FlatList>(null);
   const convId = conversation.conversation_id;
 
-  // Decrypt one message — uses DR if ratchet_header present, legacy otherwise
+  // Resolve one message to plaintext.
+  // DR keys are single-use (forward secrecy): a message decrypts exactly ONCE,
+  // then its plaintext lives in the local store. Order matters:
+  //   1. local store hit  → done (covers everything already seen + own sends)
+  //   2. own message miss → undecryptable by design (sending-chain key), placeholder
+  //   3. never-seen incoming message → decrypt once, persist plaintext
   const decrypt = useCallback(async (msg: Message): Promise<Message> => {
+    const cached = await getPlaintext(convId, msg.id);
+    if (cached !== null) return { ...msg, plaintext: cached };
+
+    if (msg.sender_id === user!.id) {
+      return { ...msg, plaintext: '[Envoyé depuis un autre appareil]', error: true };
+    }
+
     try {
       let plaintext: string;
       if (msg.ratchet_header) {
@@ -82,25 +95,48 @@ export default function ChatScreen({ conversation, onBack }: Props) {
       } else {
         plaintext = await decryptMessage(msg.ciphertext, msg.iv, convId);
       }
+      await setPlaintext(convId, msg.id, plaintext, msg.expires_at);
       return { ...msg, plaintext };
     } catch {
+      // Lost a race: a concurrent path (socket vs catch-up fetch) may have
+      // decrypted this exact message while we waited on the ratchet lock —
+      // its single-use key is consumed but the plaintext is already cached.
+      const late = await getPlaintext(convId, msg.id);
+      if (late !== null) return { ...msg, plaintext: late };
       return { ...msg, plaintext: '[Clé incorrecte ou manquante]', error: true };
     }
-  }, [convId]);
+  }, [convId, user]);
 
-  const loadMessages = useCallback(async () => {
-    try {
-      const { messages: raw } = await api.messages.get(convId);
-      const decrypted: Message[] = [];
-      for (const msg of raw) {
-        decrypted.push(await decrypt(msg));
+  // Coalesced: reconnect + foreground can both request a reload at once —
+  // a single in-flight pass serves both callers.
+  const loadInFlight = useRef<Promise<void> | null>(null);
+
+  const loadMessages = useCallback(() => {
+    if (loadInFlight.current) return loadInFlight.current;
+    loadInFlight.current = (async () => {
+      try {
+        const { messages: raw } = await api.messages.get(convId);
+        const decrypted: Message[] = [];
+        for (const msg of raw) {
+          decrypted.push(await decrypt(msg));
+        }
+        // Merge: keep messages that arrived live via socket while we were loading
+        setMessages(prev => {
+          const loaded = new Set(decrypted.map(m => m.id));
+          const merged = [...decrypted, ...prev.filter(m => !loaded.has(m.id))];
+          // Polled reload: skip the re-render when nothing actually changed
+          const unchanged = merged.length === prev.length
+            && merged.every((m, i) => m.id === prev[i].id && m.plaintext === prev[i].plaintext);
+          return unchanged ? prev : merged;
+        });
+      } catch (err: any) {
+        console.error('Failed to load messages', err.message);
+      } finally {
+        setLoading(false);
+        loadInFlight.current = null;
       }
-      setMessages(decrypted);
-    } catch (err: any) {
-      console.error('Failed to load messages', err.message);
-    } finally {
-      setLoading(false);
-    }
+    })();
+    return loadInFlight.current;
   }, [convId, decrypt]);
 
   // ── Session establishment (X3DH + DR) ────────────────────────────────────
@@ -190,12 +226,27 @@ export default function ChatScreen({ conversation, onBack }: Props) {
         expires_at:     msg.expiresAt ?? msg.expires_at ?? null,
       };
       const decrypted = await decrypt(normalised);
-      setMessages(prev => [...prev, decrypted]);
+      // Dedup: the same message can also come back via loadMessages
+      setMessages(prev => prev.some(m => m.id === decrypted.id) ? prev : [...prev, decrypted]);
       getSocket()?.emit('message:read', { messageId: msg.id, conversationId: convId });
-      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
     });
 
-    return () => offNewMessage();
+    // Catch-up: iOS drops the socket in background, and push doesn't reach
+    // Expo Go — messages sent meanwhile only exist on the server. Refetch on
+    // reconnect/foreground + a light poll while the conversation is open;
+    // the local store makes each pass cheap and idempotent (cache hits).
+    onReconnect(() => { loadMessages(); });
+    const appStateSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') loadMessages();
+    });
+    const pollId = setInterval(() => loadMessages(), 8000);
+
+    return () => {
+      offNewMessage();
+      offReconnect();
+      appStateSub.remove();
+      clearInterval(pollId);
+    };
   }, [convId]);
 
   // ── Send message ──────────────────────────────────────────────────────────
@@ -209,12 +260,13 @@ export default function ChatScreen({ conversation, onBack }: Props) {
       const ratchetHeader = JSON.stringify(header);
       const expiresIn = TTL_OPTIONS[ttlIndex].value;
       const { id, sentAt, expiresAt } = await api.messages.send(convId, ciphertext, iv, ratchetHeader, expiresIn);
+      // Own messages can never be re-decrypted (sending-chain key) — persist now
+      setPlaintext(convId, id, text, expiresAt).catch(() => {});
       setMessages(prev => [...prev, {
         id, sender_id: user!.id,
         ciphertext, iv, ratchet_header: ratchetHeader, sent_at: sentAt,
         expires_at: expiresAt, plaintext: text,
       }]);
-      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
     } catch (err: any) {
       Alert.alert('Échec', err.message);
       setInput(text);
@@ -306,6 +358,7 @@ export default function ChatScreen({ conversation, onBack }: Props) {
             renderItem={renderMessage}
             contentContainerStyle={styles.messageList}
             onLayout={() => flatListRef.current?.scrollToEnd({ animated: false })}
+            onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
           />
         )
       }
@@ -317,7 +370,7 @@ export default function ChatScreen({ conversation, onBack }: Props) {
           onPress={() => setTtlIndex(i => (i + 1) % TTL_OPTIONS.length)}
           disabled={!canTypeAndSend}
         >
-          <Text style={[styles.ttlText, TTL_OPTIONS[ttlIndex].value && styles.ttlActive]}>
+          <Text style={[styles.ttlText, TTL_OPTIONS[ttlIndex].value !== null && styles.ttlActive]}>
             {TTL_OPTIONS[ttlIndex].value ? `🔥${TTL_OPTIONS[ttlIndex].label}` : '∞'}
           </Text>
         </TouchableOpacity>
@@ -372,8 +425,8 @@ const styles = StyleSheet.create({
   statusText: { color: '#aaa', fontSize: 12, textAlign: 'center', lineHeight: 17 },
   messageList: { padding: 16, paddingBottom: 8 },
   bubble: { maxWidth: '78%', borderRadius: 16, padding: 10, marginBottom: 8 },
-  bubbleMine: { alignSelf: 'flex-end', backgroundColor: '#1a3a6a', borderBottomRightRadius: 4 },
-  bubbleTheirs: { alignSelf: 'flex-start', backgroundColor: '#1a1a2e', borderBottomLeftRadius: 4 },
+  bubbleMine: { alignSelf: 'flex-start', backgroundColor: '#1a3a6a', borderBottomLeftRadius: 4 },
+  bubbleTheirs: { alignSelf: 'flex-end', backgroundColor: '#1a1a2e', borderBottomRightRadius: 4 },
   bubbleText: { color: '#fff', fontSize: 15, lineHeight: 20 },
   bubbleError: { color: '#f66', fontStyle: 'italic' },
   bubbleMeta: { flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 6, marginTop: 4 },

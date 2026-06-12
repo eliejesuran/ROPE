@@ -130,7 +130,8 @@ services/
   api.ts                        — fetch wrapper + tous les endpoints (messages, keys, push, account)
   authContext.tsx               — session, logout, upload key bundle, rotation SPK/OPKs, push token
   socket.ts                     — socket.io client, reconnect sur AppState
-  crypto.ts                     — AES-256-GCM + X3DH + Double Ratchet + rotateSignedPreKey()
+  crypto.ts                     — AES-256-GCM + X3DH + Double Ratchet (mutex par conv) + wipeAllCryptoState()
+  messageStore.ts               — store local de plaintext chiffré (les clés DR sont à usage unique)
 metro.config.js                 — unstable_enablePackageExports pour @noble/curves
 ```
 
@@ -212,14 +213,25 @@ Format ciphertext : `base64(cipher_bytes ‖ 16-byte GCM auth tag)` — compatib
 
 ## Tests manuels Sprint 3
 
-### Push notifications (nécessite un vrai appareil physique)
+### Push notifications (nécessite un **dev build EAS** — pas Expo Go)
+
+> ⚠️ **Expo Go ne supporte plus les push distants depuis le SDK 53.** `registerPushToken()` est automatiquement sauté dans Expo Go (log `[Push] Expo Go ne supporte pas les push distants`). Le warning `No "projectId" found` est aussi lié : le token Expo nécessite un projet EAS.
+
+Préparation (une fois) :
+```bash
+npm install -g eas-cli
+eas login                       # compte Expo gratuit
+cd mobile && eas init           # ajoute extra.eas.projectId dans app.json
+eas build --profile development --platform ios   # nécessite Apple Developer (99$/an) pour APNs
+# installer le build sur l'iPhone, puis : npx expo start --dev-client
+```
+
+Test :
 1. iPhone A connecté → passer en arrière-plan (ou couper le WiFi)
 2. iPhone B envoie un message → iPhone A doit recevoir une notification push
 3. Tapper la notif → l'app s'ouvre sur la bonne conversation
 4. Vérifier côté backend : `SELECT * FROM device_tokens;` doit contenir le token Expo
 5. Au logout iPhone A → token supprimé de `device_tokens`
-
-> Sur simulateur, les push ne fonctionnent pas (limitation Apple/Google). Tester sur device réel avec `npx expo start --tunnel` ou build EAS.
 
 ### Messages éphémères
 1. Ouvrir une conversation → appuyer sur le bouton `∞` à gauche de l'input → passer à `🔥1h`
@@ -237,6 +249,46 @@ Format ciphertext : `base64(cipher_bytes ‖ 16-byte GCM auth tag)` — compatib
 1. Après login, vérifier : `GET /api/keys/status` → `{ opkCount: 10, spkId: 1, spkCreatedAt: "..." }`
 2. Simuler OPKs bas : `DELETE FROM one_time_prekeys WHERE user_id = '...' AND key_id > 3;` → se déconnecter / reconnecter → `opkCount` doit remonter à 13 (10 nouveaux ajoutés)
 3. Simuler SPK ancien : `UPDATE device_keys SET spk_created_at = NOW() - INTERVAL '8 days' WHERE user_id = '...';` → reconnecter → `spk_id` doit passer à 2
+
+---
+
+## ⚠️ Bugs connus — audit crypto (12/06/2026)
+
+**Symptôme** : les messages s'affichent `[Clé incorrecte ou manquante]` ; le timer 🔥 reste correct car `expires_at` est une métadonnée hors chiffrement.
+
+**Cause racine — architecture incompatible avec le Double Ratchet** : l'app re-télécharge l'historique du serveur et le re-déchiffre à **chaque** ouverture de conversation (`loadMessages`). Or les clés DR sont à usage unique (forward secrecy) : un message ne peut être déchiffré qu'**une seule fois**, puis sa clé est effacée et la chaîne avance. Tout re-déchiffrement échoue par design — y compris pour ses propres messages, qu'on n'a jamais pu déchiffrer (clé de la chaîne d'envoi, pas de réception). Le modèle correct (Signal) : déchiffrer une fois à la réception, stocker le plaintext en local, ne jamais re-déchiffrer.
+
+| # | Gravité | Statut | Fichier | Bug | Fix |
+|---|---|---|---|---|---|
+| 1 | 🔴 Critique | ✅ Corrigé 12/06 | `ChatScreen.tsx` `loadMessages` | Re-déchiffrement de l'historique à chaque ouverture — impossible avec DR (clés à usage unique) → toute la conv affiche l'erreur dès la réouverture | **`messageStore.ts`** : plaintext persisté localement après le 1er (et seul possible) déchiffrement — fichier JSON par conv chiffré AES-256-GCM (clé en SecureStore), TTL éphémères honoré localement |
+| 2 | 🔴 Critique | ✅ Corrigé 12/06 | `ChatScreen.tsx` `decrypt` | Ses **propres** messages étaient passés à `drDecrypt` (aucun test sur `sender_id`) → `header.dh` = sa propre clé ratchet → échec garanti | Cache-first ; plaintext stocké au moment de l'envoi ; jamais de `drDecrypt` sur ses propres messages |
+| 3 | 🔴 Critique | ⚠️ Procédure | État SecureStore des 2 appareils | Ratchets des téléphones **déjà désynchronisés** par l'ancien `Promise.all` + l'ancien logout/delete ne purgeait **aucun** état crypto local (SecureStore survit) | La suppression de compte purge désormais tout (`wipeAllCryptoState` + `wipeMessageStore`). Pour des comptes supprimés avec l'ancien code : re-créer les comptes suffit (nouvelle conv = X3DH neuf, l'état périmé est orphelin) |
+| 4 | 🟠 Élevé | ✅ Corrigé 12/06 | `ChatScreen.tsx`, `crypto.ts` | Race : message socket pendant la boucle `loadMessages` → deux `drDecrypt` concurrents (pas de mutex) + doublon dans la liste | Mutex par conversation (`withDRLock`) autour de `drEncrypt`/`drDecrypt` + dédup par `id` + merge au lieu d'écrasement dans `loadMessages` |
+| 5 | 🟠 Élevé | ❌ À faire | `ChatScreen.tsx` (migration) + `keys.js` | Le serveur renvoie 404 à l'initiateur sur `GET /x3dh-init` → la branche `initiator` de la migration Sprint-2 est inatteignable → les **deux** appareils migrent en `responder` → conv bloquée « En attente du premier message… » | Stocker le rôle (`x3dh_role_<convId>`) en SecureStore au moment du X3DH initial (devient obsolète quand plus aucune conv Sprint-2 n'existe) |
+| 6 | 🟠 Élevé | ❌ À faire | `crypto.ts` `rotateSignedPreKey` | La rotation écrase `spk_priv` → un X3DH init posté contre l'**ancien** SPK devient irrésoluble (`x3dhResponder` lit le SPK courant) → SK divergents | Conserver les anciens `spk_priv_<id>` ≥ 30 j ; stocker `spkId` dans `x3dh_sessions` et le rejouer côté responder |
+| 7 | 🟠 Élevé | ✅ Corrigé 12/06 | `keys.js` `PUT /bundle` | `spk_created_at` jamais rafraîchi à la rotation (le `DEFAULT NOW()` ne joue qu'à l'INSERT) → passé 7 jours, **rotation à chaque login** (aggrave le bug 6) | `spk_created_at = NOW()` dans le `ON CONFLICT DO UPDATE` quand `spk_id` change |
+| 8 | 🟡 Moyen | ❌ À faire | `keys.js` / réinstallation | `x3dh_sessions` jamais supprimée ni invalidée — après réinstallation d'un appareil, l'autre garde son vieil état et le réinstallé consomme un init périmé ; idem OPKs orphelines en DB | Invalider init + OPKs quand `device_keys.ik_pub` change ; endpoint de reset de session |
+| 9 | 🟡 Moyen | ✅ Corrigé 12/06 | `crypto.ts` `x3dhResponder` | OPK privée manquante ignorée **en silence** → SK différent de celui de l'initiateur, sans erreur visible | `throw` explicite → l'UI affiche « Chiffrement non établi » au lieu de messages cassés |
+| 10 | 🟡 Moyen | ❌ À faire | `crypto.ts` `saveDRState` | L'état DR (jusqu'à 50 `MK_skipped`) peut dépasser la limite **2048 octets** de SecureStore → écriture en échec selon la plateforme | Déplacer `dr_state` vers un fichier chiffré (même mécanique que `messageStore.ts`) |
+| 11 | ⚪ Mineur | ❌ À faire | `ChatScreen.tsx` `formatExpiry` | Le compte à rebours 🔥 est figé (calculé au render, aucun tick) | Re-render périodique (`setInterval` 30 s) |
+| 12 | 🟠 Élevé | ✅ Corrigé 12/06 | `authContext.tsx` | Connexion d'un **autre compte** sur le même téléphone : l'état crypto du compte précédent (IK, ratchets, plaintexts) était réutilisé tel quel → sessions désynchronisées + fuite d'historique entre comptes | Marqueur `state_owner_phone` ; si le numéro change → `wipeAllCryptoState()` + `wipeMessageStore()` avant de générer les clés |
+| 13 | 🟠 Élevé | ✅ Corrigé 12/06 | `ChatScreen.tsx`, `socket.ts` | iOS coupe le socket en arrière-plan ; les messages envoyés pendant ce temps n'étaient **jamais** affichés tant que la conv restait ouverte (« messages perdus ») — et le push ne réveille pas Expo Go | Catch-up : refetch sur reconnexion socket (`onReconnect`) + retour au premier plan (`AppState`) + **poll 8 s** tant que la conv est ouverte — peu coûteux car le store local rend l'opération idempotente (cache hits, re-render sauté si rien de neuf) |
+| 14 | 🟡 Moyen | ❌ À faire | `ChatScreen.tsx` + `getMessages` | Seuls les 50 derniers messages sont chargés (`LIMIT 50`), aucune pagination dans l'UI → au-delà, les anciens messages semblent « perdus » | Pagination `before=` au scroll vers le haut (l'API la supporte déjà) |
+
+### Architecture du store local (fix bugs 1+2 — modèle Signal)
+
+```
+Réception (socket ou fetch) ──► drDecrypt UNE fois ──► messageStore (fichier chiffré)
+Envoi                        ──► drEncrypt           ──► messageStore (plaintext local)
+Affichage (toute ouverture)  ──► messageStore d'abord ; déchiffrement seulement si jamais vu
+```
+
+- `mobile/src/services/messageStore.ts` — un fichier JSON par conversation dans `documentDirectory/msgstore/`, chiffré AES-256-GCM avec `msgstore_key` (SecureStore). Les entrées portent `expires_at` → les éphémères disparaissent aussi du store local, même hors-ligne.
+- Ses propres messages sans cache (autre appareil) → placeholder `[Envoyé depuis un autre appareil]`, jamais de tentative de déchiffrement.
+- Suppression de compte → `wipeAllCryptoState()` (IK, SPK, OPKs, états DR via le registre `conv_registry`) + `wipeMessageStore()` (RGPD).
+- `expo-notifications` réaligné `^56.0.17` → `~0.32.17` (version SDK 54 — l'ancienne cassait les types et risquait des erreurs natives dans Expo Go).
+
+**Reste à faire** : 6 → 5 → 8 → 10 → 11 (le 6 avant que la rotation SPK 7 jours ne se déclenche en usage réel).
 
 ---
 
