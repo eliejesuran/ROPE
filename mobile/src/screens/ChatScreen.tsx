@@ -12,6 +12,7 @@ import {
   getConversationKey,
   x3dhInitiator, x3dhResponder,
   hasDRState, drCanSend, drEncrypt, drDecrypt,
+  getKnownPeerIk, setKnownPeerIk, wipeConversationCrypto,
   type DRHeader,
 } from '../services/crypto';
 import { getPlaintext, setPlaintext } from '../services/messageStore';
@@ -69,9 +70,12 @@ export default function ChatScreen({ conversation, onBack }: Props) {
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);    // older pages left to fetch
   const [tick, setTick] = useState(0);             // re-render driver for 🔥 countdowns
+  const [identityChanged, setIdentityChanged] = useState(false); // reset-protocol banner
   const flatListRef = useRef<FlatList>(null);
   const loadingOlder = useRef(false);
   const suppressAutoScroll = useRef(false);        // pagination prepend must not yank to bottom
+  const identityRecheckDone = useRef(false);       // one identity re-check per mount
+  const identityRecheckRef = useRef<(() => void) | null>(null);
   const convId = conversation.conversation_id;
 
   // Resolve one message to plaintext.
@@ -107,6 +111,9 @@ export default function ChatScreen({ conversation, onBack }: Props) {
       // its single-use key is consumed but the plaintext is already cached.
       const late = await getPlaintext(convId, msg.id);
       if (late !== null) return { ...msg, plaintext: late };
+      // A fresh message we can't decrypt can mean the peer reinstalled the
+      // app (new identity, new ratchet) — trigger one identity re-check.
+      identityRecheckRef.current?.();
       return { ...msg, plaintext: '[Clé incorrecte ou manquante]', error: true };
     }
   }, [convId, user]);
@@ -170,65 +177,103 @@ export default function ChatScreen({ conversation, onBack }: Props) {
     }
   }, [convId, decrypt, hasMore, messages]);
 
-  // ── Session establishment (X3DH + DR) ────────────────────────────────────
-  useEffect(() => {
-    (async () => {
-      // Usable session = conversation key + Double Ratchet state
-      if ((await getConversationKey(convId)) && (await hasDRState(convId))) {
-        setDrReady(await drCanSend(convId));
-        setKeyStatus('ready');
-        await loadMessages();
-        return;
+  // ── Session establishment (X3DH + DR) — includes the reset protocol ───────
+  const establishSession = useCallback(async () => {
+    // Identity check: if the contact's IK changed (reinstall / new device),
+    // our ratchet can never re-synchronise — tear it down and re-handshake.
+    // The decrypted history (messageStore) is kept.
+    try {
+      const { ikPub: peerIk } = await api.keys.getIdentity(conversation.contact_id);
+      const known = await getKnownPeerIk(convId);
+      if (known && known !== peerIk) {
+        console.warn('[X3DH] Peer identity changed — resetting session');
+        await wipeConversationCrypto(convId);
+        setIdentityChanged(true);
+      } else if (!known && (await hasDRState(convId))) {
+        // Session predates identity pinning — trust on first use
+        await setKnownPeerIk(convId, peerIk);
       }
+    } catch { /* offline or contact has no bundle yet — keep local state */ }
 
-      // No usable session — establish one via X3DH
-      setKeyStatus('establishing');
-      try {
-        let initData:
-          { initiatorId: string; ikPub: string; ekPub: string; opkId: number | null; spkId: number | null } | null = null;
-        try { initData = await api.keys.getX3DHInit(convId); } catch { /* no init yet */ }
+    // Usable session = conversation key + Double Ratchet state
+    if ((await getConversationKey(convId)) && (await hasDRState(convId))) {
+      setDrReady(await drCanSend(convId));
+      setKeyStatus('ready');
+      return;
+    }
 
-        if (initData) {
-          // Become responder: the other party already posted the X3DH init
-          await x3dhResponder(convId, initData);
-        } else {
-          // Become initiator: fetch contact's bundle and post the X3DH init
-          const bundle   = await api.keys.getBundle(conversation.contact_id);
-          const myIkPub  = (await SecureStore.getItemAsync('ik_pub'))!;
-          const { ekPub, opkId, spkId } = await x3dhInitiator(convId, bundle);
+    // No usable session — establish one via X3DH
+    setKeyStatus('establishing');
+    try {
+      let initData:
+        { initiatorId: string; ikPub: string; ekPub: string; opkId: number | null; spkId: number | null } | null = null;
+      try { initData = await api.keys.getX3DHInit(convId); } catch { /* no init yet */ }
 
-          try {
-            await api.keys.postX3DHInit(convId, { ikPub: myIkPub, ekPub, opkId, spkId });
-          } catch (err: any) {
-            if (err.message === 'X3DH init already exists') {
-              try {
-                // Race: the other party posted first — become responder
-                const lateInit = await api.keys.getX3DHInit(convId);
-                await x3dhResponder(convId, lateInit);
-              } catch (e: any) {
-                if (e.message === 'No X3DH init found') {
-                  // WE are the recorded initiator but lost the local session
-                  // (reinstall): the stored init is unrecoverable for everyone.
-                  // Invalidate it and post our fresh one instead.
-                  await api.keys.deleteX3DHInit(convId);
-                  await api.keys.postX3DHInit(convId, { ikPub: myIkPub, ekPub, opkId, spkId });
-                } else {
-                  throw e;
-                }
+      if (initData) {
+        // Become responder: the other party already posted the X3DH init
+        await x3dhResponder(convId, initData);
+      } else {
+        // Become initiator: fetch contact's bundle and post the X3DH init
+        const bundle   = await api.keys.getBundle(conversation.contact_id);
+        const myIkPub  = (await SecureStore.getItemAsync('ik_pub'))!;
+        const { ekPub, opkId, spkId } = await x3dhInitiator(convId, bundle);
+
+        try {
+          await api.keys.postX3DHInit(convId, { ikPub: myIkPub, ekPub, opkId, spkId });
+        } catch (err: any) {
+          if (err.message === 'X3DH init already exists') {
+            try {
+              // Race: the other party posted first — become responder
+              const lateInit = await api.keys.getX3DHInit(convId);
+              await x3dhResponder(convId, lateInit);
+            } catch (e: any) {
+              if (e.message === 'No X3DH init found') {
+                // WE are the recorded initiator but lost the local session
+                // (reinstall): the stored init is unrecoverable for everyone.
+                // Invalidate it and post our fresh one instead.
+                await api.keys.deleteX3DHInit(convId);
+                await api.keys.postX3DHInit(convId, { ikPub: myIkPub, ekPub, opkId, spkId });
+              } else {
+                throw e;
               }
-            } else {
-              throw err;
             }
+          } else {
+            throw err;
           }
         }
-
-        setDrReady(await drCanSend(convId));
-        setKeyStatus('ready');
-      } catch (err: any) {
-        console.error('[X3DH] Session establishment failed', err.message);
-        setKeyStatus('error');
       }
 
+      setDrReady(await drCanSend(convId));
+      setKeyStatus('ready');
+    } catch (err: any) {
+      console.error('[X3DH] Session establishment failed', err.message);
+      setKeyStatus('error');
+    }
+  }, [convId, conversation.contact_id]);
+
+  useEffect(() => {
+    identityRecheckDone.current = false;
+    // A fresh message we couldn't decrypt while the conversation is open can
+    // mean the peer reinstalled — one re-check per mount: if the identity
+    // really changed, reset, re-handshake and catch up (the failed message
+    // becomes decryptable: it sits at the start of the new sending chain).
+    identityRecheckRef.current = () => {
+      if (identityRecheckDone.current) return;
+      identityRecheckDone.current = true;
+      (async () => {
+        try {
+          const { ikPub: peerIk } = await api.keys.getIdentity(conversation.contact_id);
+          const known = await getKnownPeerIk(convId);
+          if (known && known !== peerIk) {
+            await establishSession();   // detects the mismatch → wipe + re-handshake
+            await loadMessages();
+          }
+        } catch { /* offline — ignore */ }
+      })();
+    };
+
+    (async () => {
+      await establishSession();
       await loadMessages();
     })();
 
@@ -360,6 +405,14 @@ export default function ChatScreen({ conversation, onBack }: Props) {
           </Text>
         </View>
       )}
+      {identityChanged && (
+        <View style={[styles.statusBanner, styles.statusBannerWarn]}>
+          <Text style={styles.statusText}>
+            🔑 L'identité de votre contact a changé (réinstallation ou nouvel appareil).
+            Le chiffrement a été ré-établi avec ses nouvelles clés.
+          </Text>
+        </View>
+      )}
       {isEstablished && !drReady && (
         <View style={styles.statusBanner}>
           <Text style={styles.statusText}>
@@ -451,6 +504,7 @@ const styles = StyleSheet.create({
     borderBottomColor: '#1a2a4a', padding: 12,
   },
   statusBannerError: { backgroundColor: '#1a0f00', borderBottomColor: '#3a2000' },
+  statusBannerWarn: { backgroundColor: '#1a1505', borderBottomColor: '#3a3000' },
   statusText: { color: '#aaa', fontSize: 12, textAlign: 'center', lineHeight: 17 },
   messageList: { padding: 16, paddingBottom: 8 },
   bubble: { maxWidth: '78%', borderRadius: 16, padding: 10, marginBottom: 8 },

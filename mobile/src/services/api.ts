@@ -96,6 +96,9 @@ export const api = {
         opk: { id: number; pub: string } | null;
       }>(`/api/keys/bundle/${userId}`),
 
+    getIdentity: (userId: string) =>
+      request<{ userId: string; ikPub: string }>(`/api/keys/identity/${userId}`),
+
     postX3DHInit: (conversationId: string, data: { ikPub: string; ekPub: string; opkId: number | null; spkId?: number | null }) =>
       request('/api/keys/x3dh-init', {
         method: 'POST',

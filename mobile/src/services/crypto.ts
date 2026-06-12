@@ -236,6 +236,9 @@ export async function x3dhInitiator(
 
   const sk = hkdf(sha256, concatU8(...parts), undefined, 'ROPE_X3DH_v1', KEY_SIZE);
   await storeConversationKey(conversationId, uint8ArrayToBase64(sk));
+  // Pin the peer's identity key — a future mismatch means reinstall/new
+  // device, and the session must be re-established (reset protocol)
+  await setKnownPeerIk(conversationId, theirBundle.ikPub);
 
   // Initialize Double Ratchet as initiator — can send immediately
   await initDRAsInitiator(conversationId, sk, spkBPub);
@@ -305,6 +308,8 @@ export async function x3dhResponder(
 
   const sk = hkdf(sha256, concatU8(...parts), undefined, 'ROPE_X3DH_v1', KEY_SIZE);
   await storeConversationKey(conversationId, uint8ArrayToBase64(sk));
+  // Pin the peer's identity key (reset-protocol anchor)
+  await setKnownPeerIk(conversationId, initData.ikPub);
 
   // Initialize Double Ratchet as responder — CKs=null until first message
   // received. DHs MUST be the same SPK pair used in the X3DH above.
@@ -602,6 +607,31 @@ export async function getConversationKey(conversationId: string): Promise<string
   return SecureStore.getItemAsync(`conv_key_${conversationId}`);
 }
 
+// ── Peer identity pinning (session reset protocol) ────────────────────────────
+// The contact's IK is pinned when the session is established. If the server
+// later reports a different IK, the contact reinstalled (or changed device):
+// the local ratchet can never re-synchronise and must be torn down.
+
+export async function getKnownPeerIk(conversationId: string): Promise<string | null> {
+  return SecureStore.getItemAsync(`peer_ik_${conversationId}`);
+}
+
+export async function setKnownPeerIk(conversationId: string, ikPub: string): Promise<void> {
+  await SecureStore.setItemAsync(`peer_ik_${conversationId}`, ikPub);
+}
+
+/**
+ * Tears down ONE conversation's session state (keys + ratchet + pinned
+ * identity) so a fresh X3DH can run. The decrypted history in messageStore
+ * is intentionally kept — old messages stay readable.
+ */
+export async function wipeConversationCrypto(conversationId: string): Promise<void> {
+  await SecureStore.deleteItemAsync(`conv_key_${conversationId}`);
+  await SecureStore.deleteItemAsync(`dr_${conversationId}`);  // legacy location
+  await deleteJSON(`dr_${conversationId}`);
+  await SecureStore.deleteItemAsync(`peer_ik_${conversationId}`);
+}
+
 /**
  * Erases ALL crypto material from SecureStore: identity keys, SPK, OPKs,
  * per-conversation session keys and ratchet states.
@@ -612,6 +642,7 @@ export async function wipeAllCryptoState(): Promise<void> {
     await SecureStore.deleteItemAsync(`conv_key_${convId}`);
     await SecureStore.deleteItemAsync(`dr_${convId}`);  // legacy location
     await deleteJSON(`dr_${convId}`);
+    await SecureStore.deleteItemAsync(`peer_ik_${convId}`);
   }
 
   const rawNext = await SecureStore.getItemAsync('opk_next_id');

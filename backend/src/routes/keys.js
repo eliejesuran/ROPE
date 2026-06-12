@@ -64,6 +64,24 @@ router.put('/bundle', async (req, res) => {
   }
 });
 
+// ── Fetch a contact's current identity key (NO OPK consumption) ──────────────
+// Used to detect identity changes (reinstall / new device): the client
+// compares this against the IK pinned at session establishment and resets
+// the session when they differ.
+router.get('/identity/:userId', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT ik_pub FROM device_keys WHERE user_id = $1',
+      [req.params.userId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'No key bundle for this user' });
+    res.json({ userId: req.params.userId, ikPub: rows[0].ik_pub });
+  } catch (err) {
+    logger.error('keys/identity fetch error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch identity key' });
+  }
+});
+
 // ── Fetch key bundle for a contact (consumes one OPK) ────────────────────────
 router.get('/bundle/:userId', async (req, res) => {
   try {

@@ -14,7 +14,7 @@
 | Suppression de compte RGPD | ✅ | `backend/src/routes/account.js` |
 | Backend Node.js + PostgreSQL + Redis | ✅ | `backend/src/` + `docker-compose.yml` |
 | App React Native / Expo 54 | ✅ | `mobile/` |
-| Batterie de tests automatisés (110 tests) | ✅ | `backend/src/__tests__/` |
+| Batterie de tests automatisés (113 tests) | ✅ | `backend/src/__tests__/` |
 | Token invalide → auto-logout | ✅ | `mobile/src/services/authContext.tsx` |
 
 ## Sprint 2 — Terminé ✅
@@ -93,8 +93,9 @@ routes/
   contacts.js               — POST /api/contacts/find, GET /api/contacts/conversations
   messages.js               — GET|POST|DELETE /api/messages
   account.js                — DELETE /api/account, GET /api/account/export (RGPD Art.20)
-  keys.js                   — PUT /api/keys/bundle, GET /api/keys/bundle/:userId
-                              POST|GET /api/keys/x3dh-init, GET /api/keys/status
+  keys.js                   — PUT /api/keys/bundle (purge si IK change), GET /api/keys/bundle/:userId
+                              GET /api/keys/identity/:userId (sans consommer d'OPK)
+                              POST|GET|DELETE /api/keys/x3dh-init, GET /api/keys/status
   push.js                   — POST /api/push/register, DELETE /api/push/unregister
 middleware/
   auth.js                   — JWT verify → req.userId
@@ -111,7 +112,7 @@ __tests__/
   contacts.test.js          — 11 tests
   messages.test.js          — 21 tests (+ éphémères)
   account.test.js           — 12 tests (+ export RGPD)
-  keys.test.js              — 25 tests (+ /status, invalidation IK, DELETE x3dh-init, spkId)
+  keys.test.js              — 28 tests (+ /status, /identity, invalidation IK, DELETE x3dh-init, spkId)
   push.test.js              — 8 tests (register/unregister)
   security.unit.test.js     — 11 tests (deterministicPhoneHash, normalisePhone)
   crypto.unit.test.js       — 9 tests (AES-GCM Node WebCrypto)
@@ -270,7 +271,7 @@ Test :
 | 5 | 🟠 Élevé | ✅ Supprimé 12/06 | `ChatScreen.tsx` (migration) | La branche `initiator` de la migration Sprint-2 était inatteignable (404 serveur à l'initiateur) → les deux appareils migraient en `responder` → conv bloquée | Code de migration **supprimé** (plus aucune conv Sprint-2 n'existe) : `conv_key` sans état DR → ré-établissement X3DH complet |
 | 6 | 🟠 Élevé | ✅ Corrigé 12/06 | `crypto.ts`, `keys.js`, `db.js` | La rotation écrasait `spk_priv` → un X3DH init posté contre l'**ancien** SPK devenait irrésoluble (`x3dhResponder` lisait le SPK courant) → SK divergents | SPK versionnés `spk_priv_<id>`/`spk_pub_<id>` conservés sur 3 rotations (~3 sem.) ; `spk_id` stocké dans `x3dh_sessions` et rejoué côté responder ; throw explicite si le SPK n'existe plus |
 | 7 | 🟠 Élevé | ✅ Corrigé 12/06 | `keys.js` `PUT /bundle` | `spk_created_at` jamais rafraîchi à la rotation (le `DEFAULT NOW()` ne joue qu'à l'INSERT) → passé 7 jours, **rotation à chaque login** (aggrave le bug 6) | `spk_created_at = NOW()` dans le `ON CONFLICT DO UPDATE` quand `spk_id` change |
-| 8 | 🟡 Moyen | ✅ Corrigé 12/06* | `keys.js` | `x3dh_sessions` jamais supprimée ni invalidée — après réinstallation, le réinstallé consommait un init périmé ; OPKs orphelines en DB | IK changé dans `PUT /bundle` → suppression OPKs + inits en attente ; `DELETE /x3dh-init/:convId` + retry client (409→404). *Limite restante : l'**autre** participant garde son vieux ratchet → protocole de reset de session à prévoir (Sprint 4) |
+| 8 | 🟡 Moyen | ✅ Corrigé 12/06 | `keys.js`, `crypto.ts`, `ChatScreen.tsx` | `x3dh_sessions` jamais supprimée ni invalidée — après réinstallation, le réinstallé consommait un init périmé, et l'**autre** participant gardait son vieux ratchet à jamais | IK changé dans `PUT /bundle` → purge OPKs + inits ; `DELETE /x3dh-init/:convId` + retry client ; **protocole de reset de session** (voir ci-dessous) |
 | 9 | 🟡 Moyen | ✅ Corrigé 12/06 | `crypto.ts` `x3dhResponder` | OPK privée manquante ignorée **en silence** → SK différent de celui de l'initiateur, sans erreur visible | `throw` explicite → l'UI affiche « Chiffrement non établi » au lieu de messages cassés |
 | 10 | 🟡 Moyen | ✅ Corrigé 12/06 | `crypto.ts`, `secureFiles.ts` | L'état DR (jusqu'à 50 `MK_skipped`) peut dépasser la limite **2048 octets** de SecureStore → écriture en échec selon la plateforme | `dr_<convId>` déplacé vers un fichier chiffré AES-256-GCM (clé en SecureStore), migration transparente depuis SecureStore |
 | 11 | ⚪ Mineur | ✅ Corrigé 12/06 | `ChatScreen.tsx` `formatExpiry` | Le compte à rebours 🔥 était figé (calculé au render, aucun tick) | Tick 30 s (`extraData` FlatList) |
@@ -291,7 +292,16 @@ Affichage (toute ouverture)  ──► messageStore d'abord ; déchiffrement seu
 - Suppression de compte → `wipeAllCryptoState()` (IK, SPK, OPKs, états DR via le registre `conv_registry`) + `wipeMessageStore()` (RGPD).
 - `expo-notifications` réaligné `^56.0.17` → `~0.32.17` (version SDK 54 — l'ancienne cassait les types et risquait des erreurs natives dans Expo Go).
 
-**Reste à faire avant la prod** : protocole de reset de session (suite du bug 8 — quand un participant réinstalle, l'autre doit détecter le changement d'identité et ré-établir le X3DH au lieu de garder son vieux ratchet). Tout le reste du tableau est corrigé.
+### Protocole de reset de session (fix complet du bug 8 — modèle Signal)
+
+Un ratchet est par nature fragile à la désynchronisation : si un participant réinstalle l'app (nouvelle IK, nouveau ratchet), l'autre ne pourra plus jamais s'engrener dessus. Le reset fonctionne par **épinglage d'identité** (TOFU — *trust on first use*) :
+
+1. **Épinglage** : au X3DH, chaque côté stocke l'IK publique du contact (`peer_ik_<convId>`, SecureStore).
+2. **Détection à l'ouverture** : `establishSession` appelle `GET /api/keys/identity/:userId` (renvoie l'IK **sans consommer d'OPK**, contrairement à `GET /bundle`) et compare. Différente → `wipeConversationCrypto()` (conv_key + état DR + peer_ik, **l'historique déchiffré est conservé**) → bandeau 🔑 → X3DH neuf.
+3. **Détection en pleine conversation** : un échec de `drDecrypt` sur un message jamais vu déclenche une re-vérification d'identité (une fois par montage). Si l'identité a changé : reset + re-handshake + re-fetch — le message déclencheur devient déchiffrable (il est en tête de la nouvelle chaîne d'envoi, n=0).
+4. **Côté serveur** : changement d'IK dans `PUT /bundle` → purge des OPKs et inits en attente (jamais de consommation d'init périmé).
+
+**Tout le tableau est corrigé — la crypto est prête pour le déploiement** (reste la checklist sécurité du Sprint 4 au moment de la mise en ligne).
 
 ---
 

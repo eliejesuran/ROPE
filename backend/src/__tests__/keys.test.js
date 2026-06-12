@@ -207,6 +207,40 @@ describe('GET /api/keys/bundle/:userId', () => {
   });
 });
 
+// ── GET /api/keys/identity/:userId ───────────────────────────────────────────
+
+describe('GET /api/keys/identity/:userId', () => {
+  it('returns the identity key without consuming an OPK', async () => {
+    const { token: aliceToken, user: alice } = await createUserAndLogin(app, '+32471000001');
+    const { token: bobToken } = await createUserAndLogin(app, '+32471000002');
+    await request(app).put('/api/keys/bundle').set('Authorization', `Bearer ${aliceToken}`).send(BUNDLE);
+
+    const res = await request(app)
+      .get(`/api/keys/identity/${alice.id}`)
+      .set('Authorization', `Bearer ${bobToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.ikPub).toBe(BUNDLE.ikPub);
+
+    // Unlike GET /bundle, the OPK pool must be untouched
+    const { rows } = await pool.query('SELECT COUNT(*) FROM one_time_prekeys WHERE user_id = $1', [alice.id]);
+    expect(parseInt(rows[0].count)).toBe(2);
+  });
+
+  it('returns 404 when the user has no bundle', async () => {
+    const { token } = await createUserAndLogin(app, '+32471000001');
+    const { user: stranger } = await createUserAndLogin(app, '+32471000002');
+    const res = await request(app)
+      .get(`/api/keys/identity/${stranger.id}`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('requires authentication', async () => {
+    const res = await request(app).get('/api/keys/identity/some-uuid');
+    expect(res.status).toBe(401);
+  });
+});
+
 // ── POST /api/keys/x3dh-init ─────────────────────────────────────────────────
 
 describe('POST /api/keys/x3dh-init', () => {
