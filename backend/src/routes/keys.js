@@ -14,6 +14,25 @@ router.put('/bundle', async (req, res) => {
       return res.status(400).json({ error: 'ikPub, ikSigningPub, spkPub, spkSig, spkId required' });
     }
 
+    // A new identity key means the device was reinstalled or the account
+    // changed hands: every stored OPK and pending X3DH init references private
+    // keys that no longer exist — consuming them would silently derive a wrong
+    // session key. Invalidate them all.
+    const { rows: prevRows } = await pool.query(
+      'SELECT ik_pub FROM device_keys WHERE user_id = $1',
+      [req.userId]
+    );
+    if (prevRows.length > 0 && prevRows[0].ik_pub !== ikPub) {
+      await pool.query('DELETE FROM one_time_prekeys WHERE user_id = $1', [req.userId]);
+      await pool.query(
+        `DELETE FROM x3dh_sessions WHERE conversation_id IN (
+           SELECT id FROM conversations WHERE participant_a = $1 OR participant_b = $1
+         )`,
+        [req.userId]
+      );
+      logger.info('Identity key changed — invalidated OPKs and pending X3DH inits', { userId: req.userId });
+    }
+
     await pool.query(
       `INSERT INTO device_keys (user_id, ik_pub, ik_signing_pub, spk_pub, spk_sig, spk_id)
        VALUES ($1, $2, $3, $4, $5, $6)
@@ -83,7 +102,7 @@ router.get('/bundle/:userId', async (req, res) => {
 // ── Store X3DH init (Alice posts so Bob can derive SK) ────────────────────────
 router.post('/x3dh-init', async (req, res) => {
   try {
-    const { conversationId, ikPub, ekPub, opkId } = req.body;
+    const { conversationId, ikPub, ekPub, opkId, spkId } = req.body;
     if (!conversationId || !ikPub || !ekPub) {
       return res.status(400).json({ error: 'conversationId, ikPub, ekPub required' });
     }
@@ -97,11 +116,11 @@ router.post('/x3dh-init', async (req, res) => {
 
     // Store with DO NOTHING — first poster wins (avoids race-condition overwrites)
     const { rows } = await pool.query(
-      `INSERT INTO x3dh_sessions (conversation_id, initiator_id, ik_pub, ek_pub, opk_id)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO x3dh_sessions (conversation_id, initiator_id, ik_pub, ek_pub, opk_id, spk_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (conversation_id) DO NOTHING
        RETURNING conversation_id`,
-      [conversationId, req.userId, ikPub, ekPub, opkId ?? null]
+      [conversationId, req.userId, ikPub, ekPub, opkId ?? null, spkId ?? null]
     );
 
     if (rows.length === 0) {
@@ -152,7 +171,7 @@ router.get('/x3dh-init/:conversationId', async (req, res) => {
     if (convRows.length === 0) return res.status(403).json({ error: 'Forbidden' });
 
     const { rows } = await pool.query(
-      'SELECT initiator_id, ik_pub, ek_pub, opk_id FROM x3dh_sessions WHERE conversation_id = $1',
+      'SELECT initiator_id, ik_pub, ek_pub, opk_id, spk_id FROM x3dh_sessions WHERE conversation_id = $1',
       [conversationId]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'No X3DH init found' });
@@ -168,10 +187,33 @@ router.get('/x3dh-init/:conversationId', async (req, res) => {
       ikPub: session.ik_pub,
       ekPub: session.ek_pub,
       opkId: session.opk_id,
+      spkId: session.spk_id,
     });
   } catch (err) {
     logger.error('keys/x3dh-init get error', { error: err.message });
     res.status(500).json({ error: 'Failed to fetch X3DH init' });
+  }
+});
+
+// ── Invalidate a pending X3DH init (session re-establishment) ─────────────────
+// Used when the recorded initiator lost its local session state: the stored
+// init is unrecoverable for everyone, so a participant deletes it and a fresh
+// X3DH can be posted.
+router.delete('/x3dh-init/:conversationId', async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+
+    const { rows: convRows } = await pool.query(
+      'SELECT id FROM conversations WHERE id = $1 AND (participant_a = $2 OR participant_b = $2)',
+      [conversationId, req.userId]
+    );
+    if (convRows.length === 0) return res.status(403).json({ error: 'Forbidden' });
+
+    await pool.query('DELETE FROM x3dh_sessions WHERE conversation_id = $1', [conversationId]);
+    res.json({ success: true });
+  } catch (err) {
+    logger.error('keys/x3dh-init delete error', { error: err.message });
+    res.status(500).json({ error: 'Failed to delete X3DH init' });
   }
 });
 

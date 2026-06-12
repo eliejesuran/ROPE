@@ -16,10 +16,16 @@ import { x25519, ed25519 } from '@noble/curves/ed25519';
 import { hkdf } from '@noble/hashes/hkdf';
 import { sha256 } from '@noble/hashes/sha256';
 import { hmac } from '@noble/hashes/hmac';
+import {
+  aesGcmEncryptString, aesGcmDecryptString,
+  uint8ArrayToBase64, u8ToBin, b64ToBin, binToB64, b64ToU8, concatU8,
+  IV_SIZE, TAG_SIZE,
+} from './aes';
+import { getJSON, setJSON, deleteJSON, wipeSecureFiles } from './secureFiles';
+
+export { b64ToU8 } from './aes';
 
 const KEY_SIZE = 32; // 256 bits
-const IV_SIZE  = 12; // 96 bits — GCM standard
-const TAG_SIZE = 16; // 128 bits — GCM authentication tag
 
 // ── AES key generation ────────────────────────────────────────────────────────
 
@@ -79,10 +85,16 @@ export async function getOrCreateSignedPreKey(): Promise<{
 }> {
   const existing = await SecureStore.getItemAsync('spk_pub');
   if (existing) {
+    const spkId = parseInt((await SecureStore.getItemAsync('spk_id')) || '1');
+    // Backfill the versioned copy (pre-rotation installs only have spk_priv)
+    if (!(await SecureStore.getItemAsync(`spk_priv_${spkId}`))) {
+      await SecureStore.setItemAsync(`spk_priv_${spkId}`, (await SecureStore.getItemAsync('spk_priv'))!);
+      await SecureStore.setItemAsync(`spk_pub_${spkId}`,  existing);
+    }
     return {
       spkPub:       existing,
       spkSig:       (await SecureStore.getItemAsync('spk_sig'))!,
-      spkId:        parseInt((await SecureStore.getItemAsync('spk_id')) || '1'),
+      spkId,
       ikSigningPub: (await SecureStore.getItemAsync('ik_signing_pub'))!,
     };
   }
@@ -96,6 +108,9 @@ export async function getOrCreateSignedPreKey(): Promise<{
   await SecureStore.setItemAsync('spk_pub',  uint8ArrayToBase64(spkPub));
   await SecureStore.setItemAsync('spk_sig',  uint8ArrayToBase64(spkSig));
   await SecureStore.setItemAsync('spk_id',   '1');
+  // Versioned copy — kept across rotations so pending X3DH inits stay resolvable
+  await SecureStore.setItemAsync('spk_priv_1', uint8ArrayToBase64(spkPriv));
+  await SecureStore.setItemAsync('spk_pub_1',  uint8ArrayToBase64(spkPub));
 
   return {
     spkPub:       uint8ArrayToBase64(spkPub),
@@ -116,6 +131,16 @@ export async function rotateSignedPreKey(): Promise<{
   const currentId = parseInt((await SecureStore.getItemAsync('spk_id')) || '1');
   const newId = currentId + 1;
 
+  // Keep the outgoing SPK under its versioned key: an X3DH init posted against
+  // it can still arrive — overwriting the private key would make that session
+  // underivable (SK divergence). Backfill first for pre-rotation installs.
+  const outgoingPriv = await SecureStore.getItemAsync('spk_priv');
+  const outgoingPub  = await SecureStore.getItemAsync('spk_pub');
+  if (outgoingPriv && outgoingPub && !(await SecureStore.getItemAsync(`spk_priv_${currentId}`))) {
+    await SecureStore.setItemAsync(`spk_priv_${currentId}`, outgoingPriv);
+    await SecureStore.setItemAsync(`spk_pub_${currentId}`,  outgoingPub);
+  }
+
   const spkPriv = await randomX25519PrivKey();
   const spkPub  = x25519.getPublicKey(spkPriv);
   const spkSig  = ed25519.sign(spkPub, sigPriv);
@@ -124,6 +149,16 @@ export async function rotateSignedPreKey(): Promise<{
   await SecureStore.setItemAsync('spk_pub',  uint8ArrayToBase64(spkPub));
   await SecureStore.setItemAsync('spk_sig',  uint8ArrayToBase64(spkSig));
   await SecureStore.setItemAsync('spk_id',   String(newId));
+  await SecureStore.setItemAsync(`spk_priv_${newId}`, uint8ArrayToBase64(spkPriv));
+  await SecureStore.setItemAsync(`spk_pub_${newId}`,  uint8ArrayToBase64(spkPub));
+
+  // Prune copies older than 2 rotations (~3 weeks at the 7-day cadence) —
+  // an init that stale must be re-established anyway
+  const pruneId = newId - 3;
+  if (pruneId >= 1) {
+    await SecureStore.deleteItemAsync(`spk_priv_${pruneId}`);
+    await SecureStore.deleteItemAsync(`spk_pub_${pruneId}`);
+  }
 
   return {
     spkPub:       uint8ArrayToBase64(spkPub),
@@ -172,9 +207,10 @@ export async function x3dhInitiator(
     ikSigningPub: string;
     spkPub:       string;
     spkSig:       string;
+    spkId:        number;
     opk:          { id: number; pub: string } | null;
   }
-): Promise<{ ekPub: string; opkId: number | null }> {
+): Promise<{ ekPub: string; opkId: number | null; spkId: number }> {
   // Verify SPK signature — guards against server-side MITM
   const spkPubBytes    = b64ToU8(theirBundle.spkPub);
   const sigBytes       = b64ToU8(theirBundle.spkSig);
@@ -204,7 +240,11 @@ export async function x3dhInitiator(
   // Initialize Double Ratchet as initiator — can send immediately
   await initDRAsInitiator(conversationId, sk, spkBPub);
 
-  return { ekPub: uint8ArrayToBase64(ekPub), opkId: theirBundle.opk?.id ?? null };
+  return {
+    ekPub: uint8ArrayToBase64(ekPub),
+    opkId: theirBundle.opk?.id ?? null,
+    spkId: theirBundle.spkId,
+  };
 }
 
 /**
@@ -215,10 +255,35 @@ export async function x3dhInitiator(
  */
 export async function x3dhResponder(
   conversationId: string,
-  initData: { ikPub: string; ekPub: string; opkId: number | null }
+  initData: { ikPub: string; ekPub: string; opkId: number | null; spkId?: number | null }
 ): Promise<void> {
-  const ikPriv  = b64ToU8((await SecureStore.getItemAsync('ik_priv'))!);
-  const spkPriv = b64ToU8((await SecureStore.getItemAsync('spk_priv'))!);
+  const ikPriv = b64ToU8((await SecureStore.getItemAsync('ik_priv'))!);
+
+  // Resolve the SPK the initiator actually used — a rotation may have
+  // happened between the init being posted and us consuming it. Using the
+  // wrong SPK would silently derive a different SK (broken session).
+  let spkPrivStr: string | null;
+  let spkPubStr:  string | null;
+  if (initData.spkId != null) {
+    spkPrivStr = await SecureStore.getItemAsync(`spk_priv_${initData.spkId}`);
+    spkPubStr  = await SecureStore.getItemAsync(`spk_pub_${initData.spkId}`);
+    if (!spkPrivStr || !spkPubStr) {
+      const currentId = parseInt((await SecureStore.getItemAsync('spk_id')) || '1');
+      if (currentId === initData.spkId) {
+        spkPrivStr = await SecureStore.getItemAsync('spk_priv');
+        spkPubStr  = await SecureStore.getItemAsync('spk_pub');
+      } else {
+        throw new Error(`X3DH: SPK ${initData.spkId} no longer available — session must be re-established`);
+      }
+    }
+  } else {
+    // Init posted before spkId tracking existed — current SPK (legacy)
+    spkPrivStr = await SecureStore.getItemAsync('spk_priv');
+    spkPubStr  = await SecureStore.getItemAsync('spk_pub');
+  }
+  if (!spkPrivStr || !spkPubStr) throw new Error('X3DH: SPK not found in SecureStore');
+
+  const spkPriv = b64ToU8(spkPrivStr);
   const ikAPub  = b64ToU8(initData.ikPub);
   const ekAPub  = b64ToU8(initData.ekPub);
 
@@ -241,8 +306,9 @@ export async function x3dhResponder(
   const sk = hkdf(sha256, concatU8(...parts), undefined, 'ROPE_X3DH_v1', KEY_SIZE);
   await storeConversationKey(conversationId, uint8ArrayToBase64(sk));
 
-  // Initialize Double Ratchet as responder — CKs=null until first message received
-  await initDRAsResponder(conversationId, sk);
+  // Initialize Double Ratchet as responder — CKs=null until first message
+  // received. DHs MUST be the same SPK pair used in the X3DH above.
+  await initDRAsResponder(conversationId, sk, spkPrivStr, spkPubStr);
 }
 
 // ── Double Ratchet ────────────────────────────────────────────────────────────
@@ -309,17 +375,27 @@ function kdfCK(ck: Uint8Array): { newCK: Uint8Array; mk: Uint8Array } {
   };
 }
 
+// DR state lives in an encrypted file: with up to 50 cached skipped keys the
+// JSON exceeds SecureStore's 2048-byte limit and writes start failing.
 async function loadDRState(convId: string): Promise<DRState | null> {
-  const raw = await SecureStore.getItemAsync(`dr_${convId}`);
-  return raw ? (JSON.parse(raw) as DRState) : null;
+  const fromFile = await getJSON<DRState>(`dr_${convId}`);
+  if (fromFile) return fromFile;
+
+  // Migration: DR state used to live directly in SecureStore
+  const legacy = await SecureStore.getItemAsync(`dr_${convId}`);
+  if (!legacy) return null;
+  const s = JSON.parse(legacy) as DRState;
+  await setJSON(`dr_${convId}`, s);
+  await SecureStore.deleteItemAsync(`dr_${convId}`);
+  return s;
 }
 
 async function saveDRState(convId: string, s: DRState): Promise<void> {
-  await SecureStore.setItemAsync(`dr_${convId}`, JSON.stringify(s));
+  await setJSON(`dr_${convId}`, s);
 }
 
 export async function hasDRState(convId: string): Promise<boolean> {
-  return (await SecureStore.getItemAsync(`dr_${convId}`)) !== null;
+  return (await loadDRState(convId)) !== null;
 }
 
 /** Returns true if this party has a sending chain (can send messages). */
@@ -328,35 +404,9 @@ export async function drCanSend(convId: string): Promise<boolean> {
   return s !== null && s.CKs !== null;
 }
 
-// AES-256-GCM encrypt with a one-time message key (node-forge)
-async function encryptWithMK(
-  mk: Uint8Array,
-  plaintext: string
-): Promise<{ ciphertext: string; iv: string }> {
-  const ivBytes = await Crypto.getRandomBytesAsync(IV_SIZE);
-  const cipher  = forge.cipher.createCipher('AES-GCM', u8ToBin(mk));
-  cipher.start({ iv: u8ToBin(ivBytes), tagLength: TAG_SIZE * 8 });
-  cipher.update(forge.util.createBuffer(forge.util.encodeUtf8(plaintext)));
-  cipher.finish();
-  const payload = cipher.output.getBytes() + (cipher.mode as any).tag.getBytes();
-  return { ciphertext: binToB64(payload), iv: uint8ArrayToBase64(ivBytes) };
-}
-
-// AES-256-GCM decrypt with a one-time message key (node-forge)
-async function decryptWithMK(
-  mk: Uint8Array,
-  ciphertext: string,
-  iv: string
-): Promise<string> {
-  const payload     = b64ToBin(ciphertext);
-  const cipherBytes = payload.slice(0, payload.length - TAG_SIZE);
-  const tag         = payload.slice(payload.length - TAG_SIZE);
-  const decipher    = forge.cipher.createDecipher('AES-GCM', u8ToBin(mk));
-  decipher.start({ iv: b64ToBin(iv), tag: forge.util.createBuffer(tag) });
-  decipher.update(forge.util.createBuffer(cipherBytes));
-  if (!decipher.finish()) throw new Error('DR decrypt: authentication tag mismatch');
-  return forge.util.decodeUtf8(decipher.output.getBytes());
-}
+// One-time message key encryption — generic AES-256-GCM from ./aes
+const encryptWithMK = aesGcmEncryptString;
+const decryptWithMK = aesGcmDecryptString;
 
 // Store message keys for messages we skipped (out-of-order delivery support)
 function cacheSkippedKeys(s: DRState, until: number): void {
@@ -421,13 +471,15 @@ async function initDRAsInitiator(
   });
 }
 
-// Initialize DR as X3DH responder: DHs = SPK key pair, CKs=null until first
-// message received (Signal spec: responder cannot send before initiator).
-async function initDRAsResponder(convId: string, sk: Uint8Array): Promise<void> {
-  const spkPrivStr = await SecureStore.getItemAsync('spk_priv');
-  const spkPubStr  = await SecureStore.getItemAsync('spk_pub');
-  if (!spkPrivStr || !spkPubStr) throw new Error('DR: SPK not found in SecureStore');
-
+// Initialize DR as X3DH responder: DHs = the SPK pair used in the X3DH
+// agreement, CKs=null until first message received (Signal spec: responder
+// cannot send before the initiator).
+async function initDRAsResponder(
+  convId: string,
+  sk: Uint8Array,
+  spkPrivStr: string,
+  spkPubStr: string
+): Promise<void> {
   await saveDRState(convId, {
     RK:         uint8ArrayToBase64(sk),
     CKs:        null,
@@ -438,29 +490,6 @@ async function initDRAsResponder(convId: string, sk: Uint8Array): Promise<void> 
     Ns: 0, Nr: 0, PN: 0,
     MK_skipped: {},
   });
-}
-
-/**
- * Migrate a Sprint-2 session (X3DH only) to Double Ratchet.
- * Called when conv_key exists but dr_state does not.
- *
- * @param role       'initiator' if this device posted the X3DH init, else 'responder'
- * @param theirSpkPub Required when role='initiator'; the contact's SPK public key (base64)
- */
-export async function initDRFromExistingSession(
-  convId: string,
-  role: 'initiator' | 'responder',
-  theirSpkPub?: string
-): Promise<void> {
-  const skB64 = await SecureStore.getItemAsync(`conv_key_${convId}`);
-  if (!skB64) throw new Error('DR migration: no session key found for conversation');
-  const sk = b64ToU8(skB64);
-  if (role === 'initiator') {
-    if (!theirSpkPub) throw new Error('DR migration: theirSpkPub required for initiator role');
-    await initDRAsInitiator(convId, sk, b64ToU8(theirSpkPub));
-  } else {
-    await initDRAsResponder(convId, sk);
-  }
 }
 
 /**
@@ -581,7 +610,8 @@ export async function getConversationKey(conversationId: string): Promise<string
 export async function wipeAllCryptoState(): Promise<void> {
   for (const convId of await getRegisteredConversations()) {
     await SecureStore.deleteItemAsync(`conv_key_${convId}`);
-    await SecureStore.deleteItemAsync(`dr_${convId}`);
+    await SecureStore.deleteItemAsync(`dr_${convId}`);  // legacy location
+    await deleteJSON(`dr_${convId}`);
   }
 
   const rawNext = await SecureStore.getItemAsync('opk_next_id');
@@ -590,29 +620,22 @@ export async function wipeAllCryptoState(): Promise<void> {
     await SecureStore.deleteItemAsync(`opk_priv_${i}`);
   }
 
+  // Versioned SPK copies (kept across rotations)
+  const spkId = parseInt((await SecureStore.getItemAsync('spk_id')) || '1');
+  for (let i = 1; i <= spkId; i++) {
+    await SecureStore.deleteItemAsync(`spk_priv_${i}`);
+    await SecureStore.deleteItemAsync(`spk_pub_${i}`);
+  }
+
   const flatKeys = [
     'ik_priv', 'ik_pub', 'ik_signing_priv', 'ik_signing_pub',
     'spk_priv', 'spk_pub', 'spk_sig', 'spk_id',
     'opk_next_id', 'opks_uploaded', 'conv_registry', 'state_owner_phone',
   ];
   for (const k of flatKeys) await SecureStore.deleteItemAsync(k);
-}
 
-// ── Generic AES-256-GCM helpers (used by the local message store) ─────────────
-
-export async function aesGcmEncryptString(
-  key: Uint8Array,
-  plaintext: string
-): Promise<{ ciphertext: string; iv: string }> {
-  return encryptWithMK(key, plaintext);
-}
-
-export async function aesGcmDecryptString(
-  key: Uint8Array,
-  ciphertext: string,
-  iv: string
-): Promise<string> {
-  return decryptWithMK(key, ciphertext, iv);
+  // Whatever remains in the encrypted file store (DR states) + its key
+  await wipeSecureFiles();
 }
 
 // ── AES-256-GCM (legacy — decrypts pre-DR messages stored without ratchet_header) ──
@@ -670,39 +693,5 @@ export async function decryptMessage(
   return forge.util.decodeUtf8(decipher.output.getBytes());
 }
 
-// ── Base64 / binary / Uint8Array helpers ─────────────────────────────────────
-
-function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let bin = '';
-  bytes.forEach(b => (bin += String.fromCharCode(b)));
-  return btoa(bin);
-}
-
-function u8ToBin(bytes: Uint8Array): string {
-  let bin = '';
-  bytes.forEach(b => (bin += String.fromCharCode(b)));
-  return bin;
-}
-
-function b64ToBin(base64: string): string {
-  return atob(base64);
-}
-
-function binToB64(bin: string): string {
-  return btoa(bin);
-}
-
-export function b64ToU8(base64: string): Uint8Array {
-  const bin   = atob(base64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
-function concatU8(...arrays: Uint8Array[]): Uint8Array {
-  const total = arrays.reduce((sum, a) => sum + a.length, 0);
-  const out   = new Uint8Array(total);
-  let offset  = 0;
-  for (const arr of arrays) { out.set(arr, offset); offset += arr.length; }
-  return out;
-}
+// Base64 / binary / Uint8Array helpers live in ./aes (shared with the
+// encrypted storage layers).

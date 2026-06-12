@@ -14,7 +14,7 @@
 | Suppression de compte RGPD | ✅ | `backend/src/routes/account.js` |
 | Backend Node.js + PostgreSQL + Redis | ✅ | `backend/src/` + `docker-compose.yml` |
 | App React Native / Expo 54 | ✅ | `mobile/` |
-| Batterie de tests automatisés (104 tests) | ✅ | `backend/src/__tests__/` |
+| Batterie de tests automatisés (110 tests) | ✅ | `backend/src/__tests__/` |
 | Token invalide → auto-logout | ✅ | `mobile/src/services/authContext.tsx` |
 
 ## Sprint 2 — Terminé ✅
@@ -111,7 +111,7 @@ __tests__/
   contacts.test.js          — 11 tests
   messages.test.js          — 21 tests (+ éphémères)
   account.test.js           — 12 tests (+ export RGPD)
-  keys.test.js              — 19 tests (+ /status)
+  keys.test.js              — 25 tests (+ /status, invalidation IK, DELETE x3dh-init, spkId)
   push.test.js              — 8 tests (register/unregister)
   security.unit.test.js     — 11 tests (deterministicPhoneHash, normalisePhone)
   crypto.unit.test.js       — 9 tests (AES-GCM Node WebCrypto)
@@ -128,9 +128,12 @@ screens/
   ChatScreen.tsx                — messages, X3DH auto, Double Ratchet, TTL picker éphémères
 services/
   api.ts                        — fetch wrapper + tous les endpoints (messages, keys, push, account)
-  authContext.tsx               — session, logout, upload key bundle, rotation SPK/OPKs, push token
-  socket.ts                     — socket.io client, reconnect sur AppState
-  crypto.ts                     — AES-256-GCM + X3DH + Double Ratchet (mutex par conv) + wipeAllCryptoState()
+  authContext.tsx               — session, logout, upload key bundle, rotation SPK/OPKs, push token,
+                                  wipe si changement de compte (state_owner_phone)
+  socket.ts                     — socket.io client, reconnect sur AppState, onReconnect (catch-up)
+  aes.ts                        — primitives AES-256-GCM + helpers base64 (partagées)
+  secureFiles.ts                — fichiers JSON chiffrés (état DR > 2048 octets SecureStore)
+  crypto.ts                     — X3DH (SPK versionnés) + Double Ratchet (mutex par conv) + wipeAllCryptoState()
   messageStore.ts               — store local de plaintext chiffré (les clés DR sont à usage unique)
 metro.config.js                 — unstable_enablePackageExports pour @noble/curves
 ```
@@ -264,16 +267,16 @@ Test :
 | 2 | 🔴 Critique | ✅ Corrigé 12/06 | `ChatScreen.tsx` `decrypt` | Ses **propres** messages étaient passés à `drDecrypt` (aucun test sur `sender_id`) → `header.dh` = sa propre clé ratchet → échec garanti | Cache-first ; plaintext stocké au moment de l'envoi ; jamais de `drDecrypt` sur ses propres messages |
 | 3 | 🔴 Critique | ⚠️ Procédure | État SecureStore des 2 appareils | Ratchets des téléphones **déjà désynchronisés** par l'ancien `Promise.all` + l'ancien logout/delete ne purgeait **aucun** état crypto local (SecureStore survit) | La suppression de compte purge désormais tout (`wipeAllCryptoState` + `wipeMessageStore`). Pour des comptes supprimés avec l'ancien code : re-créer les comptes suffit (nouvelle conv = X3DH neuf, l'état périmé est orphelin) |
 | 4 | 🟠 Élevé | ✅ Corrigé 12/06 | `ChatScreen.tsx`, `crypto.ts` | Race : message socket pendant la boucle `loadMessages` → deux `drDecrypt` concurrents (pas de mutex) + doublon dans la liste | Mutex par conversation (`withDRLock`) autour de `drEncrypt`/`drDecrypt` + dédup par `id` + merge au lieu d'écrasement dans `loadMessages` |
-| 5 | 🟠 Élevé | ❌ À faire | `ChatScreen.tsx` (migration) + `keys.js` | Le serveur renvoie 404 à l'initiateur sur `GET /x3dh-init` → la branche `initiator` de la migration Sprint-2 est inatteignable → les **deux** appareils migrent en `responder` → conv bloquée « En attente du premier message… » | Stocker le rôle (`x3dh_role_<convId>`) en SecureStore au moment du X3DH initial (devient obsolète quand plus aucune conv Sprint-2 n'existe) |
-| 6 | 🟠 Élevé | ❌ À faire | `crypto.ts` `rotateSignedPreKey` | La rotation écrase `spk_priv` → un X3DH init posté contre l'**ancien** SPK devient irrésoluble (`x3dhResponder` lit le SPK courant) → SK divergents | Conserver les anciens `spk_priv_<id>` ≥ 30 j ; stocker `spkId` dans `x3dh_sessions` et le rejouer côté responder |
+| 5 | 🟠 Élevé | ✅ Supprimé 12/06 | `ChatScreen.tsx` (migration) | La branche `initiator` de la migration Sprint-2 était inatteignable (404 serveur à l'initiateur) → les deux appareils migraient en `responder` → conv bloquée | Code de migration **supprimé** (plus aucune conv Sprint-2 n'existe) : `conv_key` sans état DR → ré-établissement X3DH complet |
+| 6 | 🟠 Élevé | ✅ Corrigé 12/06 | `crypto.ts`, `keys.js`, `db.js` | La rotation écrasait `spk_priv` → un X3DH init posté contre l'**ancien** SPK devenait irrésoluble (`x3dhResponder` lisait le SPK courant) → SK divergents | SPK versionnés `spk_priv_<id>`/`spk_pub_<id>` conservés sur 3 rotations (~3 sem.) ; `spk_id` stocké dans `x3dh_sessions` et rejoué côté responder ; throw explicite si le SPK n'existe plus |
 | 7 | 🟠 Élevé | ✅ Corrigé 12/06 | `keys.js` `PUT /bundle` | `spk_created_at` jamais rafraîchi à la rotation (le `DEFAULT NOW()` ne joue qu'à l'INSERT) → passé 7 jours, **rotation à chaque login** (aggrave le bug 6) | `spk_created_at = NOW()` dans le `ON CONFLICT DO UPDATE` quand `spk_id` change |
-| 8 | 🟡 Moyen | ❌ À faire | `keys.js` / réinstallation | `x3dh_sessions` jamais supprimée ni invalidée — après réinstallation d'un appareil, l'autre garde son vieil état et le réinstallé consomme un init périmé ; idem OPKs orphelines en DB | Invalider init + OPKs quand `device_keys.ik_pub` change ; endpoint de reset de session |
+| 8 | 🟡 Moyen | ✅ Corrigé 12/06* | `keys.js` | `x3dh_sessions` jamais supprimée ni invalidée — après réinstallation, le réinstallé consommait un init périmé ; OPKs orphelines en DB | IK changé dans `PUT /bundle` → suppression OPKs + inits en attente ; `DELETE /x3dh-init/:convId` + retry client (409→404). *Limite restante : l'**autre** participant garde son vieux ratchet → protocole de reset de session à prévoir (Sprint 4) |
 | 9 | 🟡 Moyen | ✅ Corrigé 12/06 | `crypto.ts` `x3dhResponder` | OPK privée manquante ignorée **en silence** → SK différent de celui de l'initiateur, sans erreur visible | `throw` explicite → l'UI affiche « Chiffrement non établi » au lieu de messages cassés |
-| 10 | 🟡 Moyen | ❌ À faire | `crypto.ts` `saveDRState` | L'état DR (jusqu'à 50 `MK_skipped`) peut dépasser la limite **2048 octets** de SecureStore → écriture en échec selon la plateforme | Déplacer `dr_state` vers un fichier chiffré (même mécanique que `messageStore.ts`) |
-| 11 | ⚪ Mineur | ❌ À faire | `ChatScreen.tsx` `formatExpiry` | Le compte à rebours 🔥 est figé (calculé au render, aucun tick) | Re-render périodique (`setInterval` 30 s) |
+| 10 | 🟡 Moyen | ✅ Corrigé 12/06 | `crypto.ts`, `secureFiles.ts` | L'état DR (jusqu'à 50 `MK_skipped`) peut dépasser la limite **2048 octets** de SecureStore → écriture en échec selon la plateforme | `dr_<convId>` déplacé vers un fichier chiffré AES-256-GCM (clé en SecureStore), migration transparente depuis SecureStore |
+| 11 | ⚪ Mineur | ✅ Corrigé 12/06 | `ChatScreen.tsx` `formatExpiry` | Le compte à rebours 🔥 était figé (calculé au render, aucun tick) | Tick 30 s (`extraData` FlatList) |
 | 12 | 🟠 Élevé | ✅ Corrigé 12/06 | `authContext.tsx` | Connexion d'un **autre compte** sur le même téléphone : l'état crypto du compte précédent (IK, ratchets, plaintexts) était réutilisé tel quel → sessions désynchronisées + fuite d'historique entre comptes | Marqueur `state_owner_phone` ; si le numéro change → `wipeAllCryptoState()` + `wipeMessageStore()` avant de générer les clés |
 | 13 | 🟠 Élevé | ✅ Corrigé 12/06 | `ChatScreen.tsx`, `socket.ts` | iOS coupe le socket en arrière-plan ; les messages envoyés pendant ce temps n'étaient **jamais** affichés tant que la conv restait ouverte (« messages perdus ») — et le push ne réveille pas Expo Go | Catch-up : refetch sur reconnexion socket (`onReconnect`) + retour au premier plan (`AppState`) + **poll 8 s** tant que la conv est ouverte — peu coûteux car le store local rend l'opération idempotente (cache hits, re-render sauté si rien de neuf) |
-| 14 | 🟡 Moyen | ❌ À faire | `ChatScreen.tsx` + `getMessages` | Seuls les 50 derniers messages sont chargés (`LIMIT 50`), aucune pagination dans l'UI → au-delà, les anciens messages semblent « perdus » | Pagination `before=` au scroll vers le haut (l'API la supporte déjà) |
+| 14 | 🟡 Moyen | ✅ Corrigé 12/06 | `ChatScreen.tsx` | Seuls les 50 derniers messages étaient chargés (`LIMIT 50`), aucune pagination dans l'UI → au-delà, les anciens messages semblaient « perdus » | Pagination `before=` via `onStartReached` (scroll vers le haut) + `maintainVisibleContentPosition` |
 
 ### Architecture du store local (fix bugs 1+2 — modèle Signal)
 
@@ -288,7 +291,7 @@ Affichage (toute ouverture)  ──► messageStore d'abord ; déchiffrement seu
 - Suppression de compte → `wipeAllCryptoState()` (IK, SPK, OPKs, états DR via le registre `conv_registry`) + `wipeMessageStore()` (RGPD).
 - `expo-notifications` réaligné `^56.0.17` → `~0.32.17` (version SDK 54 — l'ancienne cassait les types et risquait des erreurs natives dans Expo Go).
 
-**Reste à faire** : 6 → 5 → 8 → 10 → 11 (le 6 avant que la rotation SPK 7 jours ne se déclenche en usage réel).
+**Reste à faire avant la prod** : protocole de reset de session (suite du bug 8 — quand un participant réinstalle, l'autre doit détecter le changement d'identité et ré-établir le X3DH au lieu de garder son vieux ratchet). Tout le reste du tableau est corrigé.
 
 ---
 

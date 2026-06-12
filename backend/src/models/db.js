@@ -93,6 +93,10 @@ const SCHEMA = `
   -- SPK rotation tracking (Sprint 3)
   ALTER TABLE device_keys ADD COLUMN IF NOT EXISTS spk_created_at TIMESTAMPTZ DEFAULT NOW();
 
+  -- SPK rotation: the responder must know WHICH signed prekey the initiator
+  -- used, otherwise a rotation between init and consumption breaks the session
+  ALTER TABLE x3dh_sessions ADD COLUMN IF NOT EXISTS spk_id INTEGER;
+
   -- Push notification tokens (Sprint 3)
   CREATE TABLE IF NOT EXISTS device_tokens (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

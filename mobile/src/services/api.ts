@@ -96,16 +96,19 @@ export const api = {
         opk: { id: number; pub: string } | null;
       }>(`/api/keys/bundle/${userId}`),
 
-    postX3DHInit: (conversationId: string, data: { ikPub: string; ekPub: string; opkId: number | null }) =>
+    postX3DHInit: (conversationId: string, data: { ikPub: string; ekPub: string; opkId: number | null; spkId?: number | null }) =>
       request('/api/keys/x3dh-init', {
         method: 'POST',
         body: JSON.stringify({ conversationId, ...data }),
       }),
 
     getX3DHInit: (conversationId: string) =>
-      request<{ initiatorId: string; ikPub: string; ekPub: string; opkId: number | null }>(
+      request<{ initiatorId: string; ikPub: string; ekPub: string; opkId: number | null; spkId: number | null }>(
         `/api/keys/x3dh-init/${conversationId}`
       ),
+
+    deleteX3DHInit: (conversationId: string) =>
+      request(`/api/keys/x3dh-init/${conversationId}`, { method: 'DELETE' }),
 
     getStatus: () =>
       request<{ opkCount: number; spkId: number | null; spkCreatedAt: string | null }>(

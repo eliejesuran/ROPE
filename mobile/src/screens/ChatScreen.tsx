@@ -8,10 +8,10 @@ import * as SecureStore from 'expo-secure-store';
 import { api } from '../services/api';
 import { useAuth } from '../services/authContext';
 import {
-  encryptMessage, decryptMessage,
+  decryptMessage,
   getConversationKey,
   x3dhInitiator, x3dhResponder,
-  hasDRState, drCanSend, drEncrypt, drDecrypt, initDRFromExistingSession,
+  hasDRState, drCanSend, drEncrypt, drDecrypt,
   type DRHeader,
 } from '../services/crypto';
 import { getPlaintext, setPlaintext } from '../services/messageStore';
@@ -67,7 +67,11 @@ export default function ChatScreen({ conversation, onBack }: Props) {
   const [keyStatus, setKeyStatus] = useState<KeyStatus>('establishing');
   const [drReady, setDrReady] = useState(false);   // true when CKs exists (can send)
   const [loading, setLoading] = useState(true);
+  const [hasMore, setHasMore] = useState(true);    // older pages left to fetch
+  const [tick, setTick] = useState(0);             // re-render driver for 🔥 countdowns
   const flatListRef = useRef<FlatList>(null);
+  const loadingOlder = useRef(false);
+  const suppressAutoScroll = useRef(false);        // pagination prepend must not yank to bottom
   const convId = conversation.conversation_id;
 
   // Resolve one message to plaintext.
@@ -116,14 +120,17 @@ export default function ChatScreen({ conversation, onBack }: Props) {
     loadInFlight.current = (async () => {
       try {
         const { messages: raw } = await api.messages.get(convId);
+        if (raw.length < 50) setHasMore(false);
         const decrypted: Message[] = [];
         for (const msg of raw) {
           decrypted.push(await decrypt(msg));
         }
-        // Merge: keep messages that arrived live via socket while we were loading
+        // Merge: keep what isn't in this page — live socket arrivals AND older
+        // paginated messages — then restore chronological order
         setMessages(prev => {
           const loaded = new Set(decrypted.map(m => m.id));
-          const merged = [...decrypted, ...prev.filter(m => !loaded.has(m.id))];
+          const merged = [...decrypted, ...prev.filter(m => !loaded.has(m.id))]
+            .sort((x, y) => new Date(x.sent_at).getTime() - new Date(y.sent_at).getTime());
           // Polled reload: skip the re-render when nothing actually changed
           const unchanged = merged.length === prev.length
             && merged.every((m, i) => m.id === prev[i].id && m.plaintext === prev[i].plaintext);
@@ -139,47 +146,46 @@ export default function ChatScreen({ conversation, onBack }: Props) {
     return loadInFlight.current;
   }, [convId, decrypt]);
 
+  // Pagination: fetch the previous page when the user scrolls to the top
+  const loadOlder = useCallback(async () => {
+    if (loadingOlder.current || !hasMore || messages.length === 0) return;
+    loadingOlder.current = true;
+    try {
+      const { messages: raw } = await api.messages.get(convId, messages[0].sent_at);
+      if (raw.length < 50) setHasMore(false);
+      if (raw.length === 0) return;
+      const older: Message[] = [];
+      for (const msg of raw) {
+        older.push(await decrypt(msg));
+      }
+      suppressAutoScroll.current = true;
+      setMessages(prev => {
+        const have = new Set(prev.map(m => m.id));
+        return [...older.filter(o => !have.has(o.id)), ...prev];
+      });
+    } catch (err: any) {
+      console.error('Failed to load older messages', err.message);
+    } finally {
+      loadingOlder.current = false;
+    }
+  }, [convId, decrypt, hasMore, messages]);
+
   // ── Session establishment (X3DH + DR) ────────────────────────────────────
   useEffect(() => {
     (async () => {
-      const existingKey = await getConversationKey(convId);
-
-      if (existingKey) {
-        // Session key exists — check if DR state is also present
-        if (await hasDRState(convId)) {
-          const canSend = await drCanSend(convId);
-          setDrReady(canSend);
-          setKeyStatus('ready');
-          await loadMessages();
-          return;
-        }
-
-        // Sprint-2 session exists but no DR state — migrate to Double Ratchet
-        setKeyStatus('establishing');
-        try {
-          let initData: { initiatorId: string; ikPub: string; ekPub: string; opkId: number | null } | null = null;
-          try { initData = await api.keys.getX3DHInit(convId); } catch { /* no init yet */ }
-
-          if (initData && initData.initiatorId === user!.id) {
-            const bundle = await api.keys.getBundle(conversation.contact_id);
-            await initDRFromExistingSession(convId, 'initiator', bundle.spkPub);
-          } else {
-            await initDRFromExistingSession(convId, 'responder');
-          }
-          setDrReady(await drCanSend(convId));
-          setKeyStatus('ready');
-        } catch (err: any) {
-          console.error('[DR migration] Failed', err.message);
-          setKeyStatus('error');
-        }
+      // Usable session = conversation key + Double Ratchet state
+      if ((await getConversationKey(convId)) && (await hasDRState(convId))) {
+        setDrReady(await drCanSend(convId));
+        setKeyStatus('ready');
         await loadMessages();
         return;
       }
 
-      // No session at all — run X3DH to establish one
+      // No usable session — establish one via X3DH
       setKeyStatus('establishing');
       try {
-        let initData: { initiatorId: string; ikPub: string; ekPub: string; opkId: number | null } | null = null;
+        let initData:
+          { initiatorId: string; ikPub: string; ekPub: string; opkId: number | null; spkId: number | null } | null = null;
         try { initData = await api.keys.getX3DHInit(convId); } catch { /* no init yet */ }
 
         if (initData) {
@@ -189,15 +195,27 @@ export default function ChatScreen({ conversation, onBack }: Props) {
           // Become initiator: fetch contact's bundle and post the X3DH init
           const bundle   = await api.keys.getBundle(conversation.contact_id);
           const myIkPub  = (await SecureStore.getItemAsync('ik_pub'))!;
-          const { ekPub, opkId } = await x3dhInitiator(convId, bundle);
+          const { ekPub, opkId, spkId } = await x3dhInitiator(convId, bundle);
 
           try {
-            await api.keys.postX3DHInit(convId, { ikPub: myIkPub, ekPub, opkId });
+            await api.keys.postX3DHInit(convId, { ikPub: myIkPub, ekPub, opkId, spkId });
           } catch (err: any) {
             if (err.message === 'X3DH init already exists') {
-              // Race: the other party posted first — re-fetch and become responder
-              const lateInit = await api.keys.getX3DHInit(convId);
-              await x3dhResponder(convId, lateInit);
+              try {
+                // Race: the other party posted first — become responder
+                const lateInit = await api.keys.getX3DHInit(convId);
+                await x3dhResponder(convId, lateInit);
+              } catch (e: any) {
+                if (e.message === 'No X3DH init found') {
+                  // WE are the recorded initiator but lost the local session
+                  // (reinstall): the stored init is unrecoverable for everyone.
+                  // Invalidate it and post our fresh one instead.
+                  await api.keys.deleteX3DHInit(convId);
+                  await api.keys.postX3DHInit(convId, { ikPub: myIkPub, ekPub, opkId, spkId });
+                } else {
+                  throw e;
+                }
+              }
             } else {
               throw err;
             }
@@ -240,12 +258,15 @@ export default function ChatScreen({ conversation, onBack }: Props) {
       if (state === 'active') loadMessages();
     });
     const pollId = setInterval(() => loadMessages(), 8000);
+    // 🔥 countdowns are computed at render time — tick to refresh them
+    const tickId = setInterval(() => setTick(t => t + 1), 30000);
 
     return () => {
       offNewMessage();
       offReconnect();
       appStateSub.remove();
       clearInterval(pollId);
+      clearInterval(tickId);
     };
   }, [convId]);
 
@@ -354,11 +375,19 @@ export default function ChatScreen({ conversation, onBack }: Props) {
           <FlatList
             ref={flatListRef}
             data={messages}
+            extraData={tick}
             keyExtractor={(item) => item.id}
             renderItem={renderMessage}
             contentContainerStyle={styles.messageList}
             onLayout={() => flatListRef.current?.scrollToEnd({ animated: false })}
-            onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
+            onContentSizeChange={() => {
+              // Pagination prepends above the viewport — don't yank to bottom
+              if (suppressAutoScroll.current) { suppressAutoScroll.current = false; return; }
+              flatListRef.current?.scrollToEnd({ animated: true });
+            }}
+            onStartReached={loadOlder}
+            onStartReachedThreshold={0.1}
+            maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
           />
         )
       }

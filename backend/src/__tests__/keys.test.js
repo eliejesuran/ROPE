@@ -80,6 +80,60 @@ describe('PUT /api/keys/bundle', () => {
     expect(res.status).toBe(400);
   });
 
+  it('invalidates OPKs and pending X3DH inits when the identity key changes', async () => {
+    const { token: aliceToken, user: alice } = await createUserAndLogin(app, '+32471000001');
+    const { user: bob } = await createUserAndLogin(app, '+32471000002');
+    await request(app).put('/api/keys/bundle').set('Authorization', `Bearer ${aliceToken}`).send(BUNDLE);
+
+    const [a, b] = [alice.id, bob.id].sort();
+    const { rows } = await pool.query(
+      'INSERT INTO conversations (participant_a, participant_b) VALUES ($1, $2) RETURNING id',
+      [a, b]
+    );
+    await request(app)
+      .post('/api/keys/x3dh-init')
+      .set('Authorization', `Bearer ${aliceToken}`)
+      .send({ conversationId: rows[0].id, ikPub: BUNDLE.ikPub, ekPub: 'ZWtQdWI=', opkId: null });
+
+    // Reinstall: same user uploads a DIFFERENT identity key
+    await request(app)
+      .put('/api/keys/bundle')
+      .set('Authorization', `Bearer ${aliceToken}`)
+      .send({ ...BUNDLE, ikPub: 'bmV3SWtQdWI=', oneTimePreKeys: [] });
+
+    const { rows: opks } = await pool.query('SELECT * FROM one_time_prekeys WHERE user_id = $1', [alice.id]);
+    const { rows: inits } = await pool.query('SELECT * FROM x3dh_sessions WHERE conversation_id = $1', [rows[0].id]);
+    expect(opks.length).toBe(0);
+    expect(inits.length).toBe(0);
+  });
+
+  it('keeps OPKs and X3DH inits when re-uploading the same identity key', async () => {
+    const { token: aliceToken, user: alice } = await createUserAndLogin(app, '+32471000001');
+    const { user: bob } = await createUserAndLogin(app, '+32471000002');
+    await request(app).put('/api/keys/bundle').set('Authorization', `Bearer ${aliceToken}`).send(BUNDLE);
+
+    const [a, b] = [alice.id, bob.id].sort();
+    const { rows } = await pool.query(
+      'INSERT INTO conversations (participant_a, participant_b) VALUES ($1, $2) RETURNING id',
+      [a, b]
+    );
+    await request(app)
+      .post('/api/keys/x3dh-init')
+      .set('Authorization', `Bearer ${aliceToken}`)
+      .send({ conversationId: rows[0].id, ikPub: BUNDLE.ikPub, ekPub: 'ZWtQdWI=', opkId: null });
+
+    // Routine re-login: same identity key, rotated SPK
+    await request(app)
+      .put('/api/keys/bundle')
+      .set('Authorization', `Bearer ${aliceToken}`)
+      .send({ ...BUNDLE, spkId: 2, oneTimePreKeys: [] });
+
+    const { rows: opks } = await pool.query('SELECT * FROM one_time_prekeys WHERE user_id = $1', [alice.id]);
+    const { rows: inits } = await pool.query('SELECT * FROM x3dh_sessions WHERE conversation_id = $1', [rows[0].id]);
+    expect(opks.length).toBe(2);
+    expect(inits.length).toBe(1);
+  });
+
   it('requires authentication', async () => {
     const res = await request(app).put('/api/keys/bundle').send(BUNDLE);
     expect(res.status).toBe(401);
@@ -300,6 +354,27 @@ describe('GET /api/keys/x3dh-init/:conversationId', () => {
     expect(res.status).toBe(404);
   });
 
+  it('stores and returns the spkId used by the initiator', async () => {
+    const { token: aliceToken, user: alice } = await createUserAndLogin(app, '+32471000001');
+    const { token: bobToken, user: bob } = await createUserAndLogin(app, '+32471000002');
+    const [a, b] = [alice.id, bob.id].sort();
+    const { rows } = await pool.query(
+      'INSERT INTO conversations (participant_a, participant_b) VALUES ($1, $2) RETURNING id',
+      [a, b]
+    );
+
+    await request(app)
+      .post('/api/keys/x3dh-init')
+      .set('Authorization', `Bearer ${aliceToken}`)
+      .send({ conversationId: rows[0].id, ikPub: 'aWtQdWI=', ekPub: 'ZWtQdWI=', opkId: null, spkId: 3 });
+
+    const res = await request(app)
+      .get(`/api/keys/x3dh-init/${rows[0].id}`)
+      .set('Authorization', `Bearer ${bobToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.spkId).toBe(3);
+  });
+
   it('returns 403 if user is not a participant', async () => {
     const { user: alice } = await createUserAndLogin(app, '+32471000001');
     const { user: bob } = await createUserAndLogin(app, '+32471000002');
@@ -317,6 +392,61 @@ describe('GET /api/keys/x3dh-init/:conversationId', () => {
 
   it('requires authentication', async () => {
     const res = await request(app).get('/api/keys/x3dh-init/some-uuid');
+    expect(res.status).toBe(401);
+  });
+});
+
+// ── DELETE /api/keys/x3dh-init/:conversationId ───────────────────────────────
+
+describe('DELETE /api/keys/x3dh-init/:conversationId', () => {
+  async function makeConvWithInit() {
+    const { token: aliceToken, user: alice } = await createUserAndLogin(app, '+32471000001');
+    const { token: bobToken, user: bob } = await createUserAndLogin(app, '+32471000002');
+    const [a, b] = [alice.id, bob.id].sort();
+    const { rows } = await pool.query(
+      'INSERT INTO conversations (participant_a, participant_b) VALUES ($1, $2) RETURNING id',
+      [a, b]
+    );
+    await request(app)
+      .post('/api/keys/x3dh-init')
+      .set('Authorization', `Bearer ${aliceToken}`)
+      .send({ conversationId: rows[0].id, ikPub: 'aWtQdWI=', ekPub: 'ZWtQdWI=', opkId: null });
+    return { convId: rows[0].id, aliceToken, bobToken };
+  }
+
+  it('lets a participant delete a stale init so X3DH can restart', async () => {
+    const { convId, aliceToken, bobToken } = await makeConvWithInit();
+
+    const res = await request(app)
+      .delete(`/api/keys/x3dh-init/${convId}`)
+      .set('Authorization', `Bearer ${aliceToken}`);
+    expect(res.status).toBe(200);
+
+    // Init is gone — responder now gets 404 and a fresh init can be posted
+    const getRes = await request(app)
+      .get(`/api/keys/x3dh-init/${convId}`)
+      .set('Authorization', `Bearer ${bobToken}`);
+    expect(getRes.status).toBe(404);
+
+    const repost = await request(app)
+      .post('/api/keys/x3dh-init')
+      .set('Authorization', `Bearer ${aliceToken}`)
+      .send({ conversationId: convId, ikPub: 'bmV3', ekPub: 'bmV3RWs=', opkId: null });
+    expect(repost.status).toBe(200);
+  });
+
+  it('returns 403 if user is not a participant', async () => {
+    const { convId } = await makeConvWithInit();
+    const { token: eveToken } = await createUserAndLogin(app, '+32471000003');
+
+    const res = await request(app)
+      .delete(`/api/keys/x3dh-init/${convId}`)
+      .set('Authorization', `Bearer ${eveToken}`);
+    expect(res.status).toBe(403);
+  });
+
+  it('requires authentication', async () => {
+    const res = await request(app).delete('/api/keys/x3dh-init/some-uuid');
     expect(res.status).toBe(401);
   });
 });

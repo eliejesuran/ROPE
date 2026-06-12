@@ -16,7 +16,7 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { aesGcmEncryptString, aesGcmDecryptString, b64ToU8 } from './crypto';
+import { aesGcmEncryptString, aesGcmDecryptString, b64ToU8 } from './aes';
 
 const STORE_DIR = `${FileSystem.documentDirectory}msgstore/`;
 
